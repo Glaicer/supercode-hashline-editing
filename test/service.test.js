@@ -11,6 +11,7 @@ import {
   LineRangeError,
   MissingFileError,
   MismatchError,
+  NoChangesError,
   SeenLinesError,
   SnapshotRequiredError,
 } from "../src/service.js"
@@ -263,6 +264,14 @@ test("edit requires a Snapshot minted by read", async () => {
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
 })
 
+test("a section without a tag asks for read before edit", async () => {
+  await assert.rejects(
+    service.edit("[a.ts]\nreplace 1\n+ONE"),
+    (error) => error instanceof SnapshotRequiredError && !(error instanceof MismatchError) && /read first/i.test(error.message),
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
+})
+
 test("edit refuses missing files and points to the native write tool", async () => {
   await assert.rejects(
     service.edit("[missing.ts#AAAA]\nreplace 1\n+never"),
@@ -384,6 +393,39 @@ test("preserves a file's BOM and CRLF representation through replace", async () 
   await service.edit(`${reading.header}\nreplace 2\n+TWO`)
 
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "\uFEFFone\r\nTWO\r\n")
+})
+
+test("rejects a patch that leaves normalized text unchanged", async () => {
+  const reading = await service.read("a.ts")
+  const original = await readFile(path.join(root, "a.ts"), "utf8")
+
+  await assert.rejects(
+    service.edit(`${reading.header}\nreplace 1\n+one`),
+    (error) => error instanceof NoChangesError && /resulted in no changes/.test(error.message),
+  )
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), original)
+  assert.equal((await service.read("a.ts")).tag, reading.tag)
+})
+
+test("restores the dominant line ending for a mixed-line-ending file", async () => {
+  await writeFile(path.join(root, "a.ts"), "one\r\ntwo\nthree\n", "utf8")
+  const reading = await service.read("a.ts")
+
+  await service.edit(`${reading.header}\nreplace 2\n+TWO`)
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\nTWO\nthree\n")
+})
+
+test("keeps a missing terminal newline through append and last-line replace", async () => {
+  await writeFile(path.join(root, "a.ts"), "one\ntwo", "utf8")
+  const reading = await service.read("a.ts")
+
+  const appended = await service.edit(`${reading.header}\nappend\n+three`)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree")
+
+  await service.edit(`${appended.sections[0].header}\nreplace 3\n+THREE`)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nTHREE")
 })
 
 test("capacity failure happens before the file write", async () => {

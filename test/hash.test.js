@@ -5,6 +5,7 @@ import {
   computeDigest,
   computeTag,
   detectLineEnding,
+  normalizeFileHashText,
   normalizeToLF,
   restoreLineEndings,
   stripBom,
@@ -33,4 +34,10 @@ test("normalizes BOM and line endings and can restore the original representatio
   assert.equal(normalized, "one\ntwo\n")
   assert.equal(detectLineEnding(withoutBom), "crlf")
   assert.equal(restoreLineEndings(normalized, "crlf", true), raw)
+})
+
+test("detects the dominant line ending and trims hash-only whitespace", () => {
+  assert.equal(detectLineEnding("one\ntwo\r\nthree\n"), "lf")
+  assert.equal(detectLineEnding("one\r\ntwo\nthree\r\n"), "crlf")
+  assert.equal(normalizeFileHashText("one \t\r\ntwo\t\r"), "one\ntwo")
 })

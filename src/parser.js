@@ -1,3 +1,5 @@
+import { SnapshotRequiredError } from "./errors.js"
+
 const SECTION_HEADER_RE = /^\[(.+)#([0-9a-fA-F]{4})\]$/
 const REPLACE_RE = /^replace\s+([1-9]\d*)(?:-([1-9]\d*))?\s*$/
 const INSERT_BEFORE_RE = /^insert\s+before\s+([1-9]\d*)\s*$/
@@ -57,6 +59,11 @@ function parseHunkHeader(line, lineNumber) {
 }
 
 function parseSectionHeader(line, lineNumber) {
+  const withoutTag = /^\[([^\]]+)\]$/.exec(line)
+  if (withoutTag && !withoutTag[1].includes("#")) {
+    throw new SnapshotRequiredError(withoutTag[1])
+  }
+
   const match = SECTION_HEADER_RE.exec(line)
   if (!match || match[1].trim() === "") {
     throw new PatchSyntaxError(
@@ -107,6 +114,9 @@ export function parsePatch(input) {
         continue
       }
       if (SECTION_HEADER_RE.test(hunkLine)) break
+      if (/^\[[^\]]+\]$/.test(hunkLine)) {
+        parseSectionHeader(hunkLine, hunkLineNumber)
+      }
 
       const hunk = parseHunkHeader(hunkLine, hunkLineNumber)
       index += 1

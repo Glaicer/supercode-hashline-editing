@@ -199,7 +199,23 @@ export function normalizeToLF(text) {
 }
 
 export function detectLineEnding(text) {
-  return /\r\n/.test(text) ? "crlf" : "lf"
+  let crlfCount = 0
+  let lfCount = 0
+
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "\r") {
+      if (text[index + 1] === "\n") {
+        crlfCount += 1
+        index += 1
+      } else {
+        lfCount += 1
+      }
+    } else if (text[index] === "\n") {
+      lfCount += 1
+    }
+  }
+
+  return crlfCount > lfCount ? "crlf" : "lf"
 }
 
 export function restoreLineEndings(text, lineEnding, bom = false) {
@@ -234,4 +250,3 @@ export function formatNumberedLines(lines, startLine = 1) {
 export function utf8ByteLength(text) {
   return bytesOf(text).byteLength
 }
-

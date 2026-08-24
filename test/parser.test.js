@@ -1,6 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
+import { SnapshotRequiredError } from "../src/errors.js"
 import { parsePatch, PatchSyntaxError } from "../src/parser.js"
 
 test("parses replace ranges and strips exactly one body prefix", () => {
@@ -86,4 +87,11 @@ test("reports an address-specific v1 alternative for unsupported operations", ()
       },
     )
   }
+})
+
+test("reports a missing tag for a later section instead of parsing it as a hunk", () => {
+  assert.throws(
+    () => parsePatch("[a.ts#AAAA]\nreplace 1\n+one\n[b.ts]\nreplace 1\n+two"),
+    (error) => error instanceof SnapshotRequiredError && /b\.ts/.test(error.message) && /read/i.test(error.message),
+  )
 })

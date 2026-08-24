@@ -575,6 +575,7 @@ export {
   LineRangeError,
   MissingFileError,
   MismatchError,
+  NoChangesError,
   SeenLinesError,
   SnapshotRequiredError,
 }
