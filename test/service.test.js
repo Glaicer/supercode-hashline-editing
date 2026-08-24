@@ -112,6 +112,24 @@ test("retargeting a link between read and edit is rejected", async () => {
   assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
 })
 
+test("retargeting a link to another in-root file cannot rebind the capability", async () => {
+  const link = path.join(root, "link.ts")
+  await writeFile(path.join(root, "b.ts"), "one\ntwo\nthree\n")
+  await symlink(path.join(root, "a.ts"), link)
+  const reading = await service.read("link.ts")
+  await service.read("b.ts")
+
+  await rm(link)
+  await symlink(path.join(root, "b.ts"), link)
+
+  await assert.rejects(
+    service.edit(`${reading.header}\nreplace 1\n+NOPE`),
+    (error) => error instanceof MismatchError && /different file/i.test(error.message),
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "one\ntwo\nthree\n")
+})
+
 test("a 4-hex tag collision is a mismatch instead of a version choice", async () => {
   const byTag = new Map()
   let first
@@ -161,7 +179,7 @@ test("a Snapshot from another rootId cannot authorize an edit", async () => {
 
   await assert.rejects(
     service.edit(`${reading.header}\nreplace 1\n+unsafe`),
-    (error) => error instanceof SnapshotRequiredError,
+    (error) => error instanceof MismatchError,
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
 })
@@ -174,4 +192,25 @@ test("preserves a file's BOM and CRLF representation through replace", async () 
   await service.edit(`${reading.header}\nreplace 2\n+TWO`)
 
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "\uFEFFone\r\nTWO\r\n")
+})
+
+test("capacity failure happens before the file write", async () => {
+  const constrained = new HashlineService({ worktree: root, directory: root, maxTotalBytes: 14 })
+  const reading = await constrained.read("a.ts")
+
+  await assert.rejects(constrained.edit(`${reading.header}\nreplace 1\n+this is too large`), /Snapshot.*limit/)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
+})
+
+test("an evicted tag is a mismatch that requires re-read", async () => {
+  const constrained = new HashlineService({ worktree: root, directory: root, maxVersionsPerPath: 1 })
+  const first = await constrained.read("a.ts")
+  await writeFile(path.join(root, "a.ts"), "new\ntwo\nthree\n")
+  await constrained.read("a.ts")
+
+  await assert.rejects(
+    constrained.edit(`${first.header}\nreplace 1\n+unsafe`),
+    (error) => error instanceof MismatchError && /re-read/i.test(error.message),
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "new\ntwo\nthree\n")
 })

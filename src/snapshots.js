@@ -89,18 +89,27 @@ export class InMemorySnapshotStore {
     if (snapshot) this.totalBytes -= utf8ByteLength(snapshot.text)
   }
 
-  /** Record a Snapshot, merging identical normalized bytes. */
-  record(input, rootId, text, options) {
+  _prepareRecord(input, rootId, text, options) {
     const snapshot = makeSnapshot(normalizeRecordInput(input, rootId, text, options))
-    const key = pathKey(snapshot.canonicalPath, snapshot.rootId)
-    const entry = this.paths.get(key)
     const size = utf8ByteLength(snapshot.text)
-
     if (size > this.maxTotalBytes) {
       throw new Error(
         `Snapshot for ${snapshot.canonicalPath} exceeds the ${this.maxTotalBytes}-byte SnapshotStore limit`,
       )
     }
+    return { snapshot, size }
+  }
+
+  /** Validate that a Snapshot can be retained without changing the store. */
+  assertCanRecord(input, rootId, text, options) {
+    return this._prepareRecord(input, rootId, text, options).snapshot
+  }
+
+  /** Record a Snapshot, merging identical normalized bytes. */
+  record(input, rootId, text, options) {
+    const { snapshot, size } = this._prepareRecord(input, rootId, text, options)
+    const key = pathKey(snapshot.canonicalPath, snapshot.rootId)
+    const entry = this.paths.get(key)
 
     if (entry) {
       const existing = entry.versions.find(

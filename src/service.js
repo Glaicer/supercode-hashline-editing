@@ -29,6 +29,10 @@ function asLineNumbers(start, lines) {
   return new Set(lines.map((_, index) => start + index))
 }
 
+function capabilityKey(inputPath, rootId) {
+  return `${rootId}\u0000${inputPath}`
+}
+
 function mapFilesystemError(error, operation, displayPath) {
   if (error instanceof PathBoundaryError) return new BoundaryError()
   if (error instanceof FileNotFoundError && operation === "edit") return new MissingFileError(displayPath)
@@ -82,6 +86,7 @@ export class HashlineService {
     this.worktree = path.resolve(worktree)
     this.directory = path.resolve(directory)
     this.filesystem = filesystem ?? new FileSystemAdapter({ root: this.worktree, roots })
+    this.readCapabilities = new Map()
     this.store =
       store ??
       new InMemorySnapshotStore({
@@ -113,6 +118,7 @@ export class HashlineService {
       lineEnding: file.lineEnding,
       bom: file.bom,
     })
+    this.readCapabilities.set(capabilityKey(inputPath, file.rootId), file.canonicalPath)
     const header = formatHeader(inputPath, snapshot.tag)
     const numbered = formatNumberedLines(visibleLines, firstLine)
     const output = numbered === "" ? header : `${header}\n${numbered}`
@@ -137,6 +143,15 @@ export class HashlineService {
 
     const section = parsed.sections[0]
     const file = await this._readFile(section.path, "edit")
+    const capability = this.readCapabilities.get(capabilityKey(section.path, file.rootId))
+    if (capability && capability !== file.canonicalPath) {
+      throw new MismatchError({
+        path: section.path,
+        expectedTag: section.tag,
+        actualTag: computeTag(file.text),
+        reason: "the read path now resolves to a different file",
+      })
+    }
     const { candidates, exact } = this.store.exactMatches(
       file.canonicalPath,
       file.rootId,
@@ -144,7 +159,16 @@ export class HashlineService {
       file.text,
     )
 
-    if (candidates.length === 0) throw new SnapshotRequiredError(section.path)
+    if (candidates.length === 0) {
+      const retained = this.store.find(file.canonicalPath, file.rootId)
+      const wasRead = this.readCapabilities.has(capabilityKey(section.path, file.rootId))
+      if (retained.length === 0 && !wasRead) throw new SnapshotRequiredError(section.path)
+      throw new MismatchError({
+        path: section.path,
+        expectedTag: section.tag,
+        actualTag: computeTag(file.text),
+      })
+    }
     if (candidates.length !== 1 || exact.length !== 1) {
       throw new MismatchError({
         path: section.path,
@@ -156,6 +180,16 @@ export class HashlineService {
     const snapshot = exact[0]
     const applied = applyReplacements(snapshot.text, section.hunks)
     if (applied.after === snapshot.text) throw new NoChangesError()
+
+    const nextSnapshotInput = {
+      canonicalPath: file.canonicalPath,
+      rootId: file.rootId,
+      text: applied.after,
+      seenLines: asLineNumbers(1, splitAddressableLines(applied.after)),
+      lineEnding: snapshot.lineEnding,
+      bom: snapshot.bom,
+    }
+    this.store.assertCanRecord(nextSnapshotInput)
 
     let committed
     try {
@@ -174,14 +208,7 @@ export class HashlineService {
     }
 
     const written = normalizeToLF(stripBom(committed.persistedText))
-    const nextSnapshot = this.store.record({
-      canonicalPath: file.canonicalPath,
-      rootId: file.rootId,
-      text: written,
-      seenLines: asLineNumbers(1, splitAddressableLines(written)),
-      lineEnding: snapshot.lineEnding,
-      bom: snapshot.bom,
-    })
+    const nextSnapshot = this.store.record({ ...nextSnapshotInput, text: written })
     const header = formatHeader(section.path, nextSnapshot.tag)
     const sectionResult = {
       path: section.path,

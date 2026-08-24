@@ -13,9 +13,11 @@ export class BoundaryError extends HashlineError {
 }
 
 export class MismatchError extends HashlineError {
-  constructor({ path, expectedTag, actualTag }) {
+  constructor({ path, expectedTag, actualTag, reason }) {
     super(
-      `Snapshot mismatch for ${path}: section uses #${expectedTag}, live file is #${actualTag}; re-read the file and retry`,
+      `Snapshot mismatch for ${path}: section uses #${expectedTag}, live file is #${actualTag}${
+        reason ? ` (${reason})` : ""
+      }; re-read the file and retry`,
     )
     this.name = "MismatchError"
     this.path = path
@@ -62,4 +64,3 @@ export class MissingFileError extends HashlineError {
     this.path = path
   }
 }
-

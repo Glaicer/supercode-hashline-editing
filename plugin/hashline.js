@@ -63,13 +63,13 @@ function serializableEditResult(result) {
   }
 }
 
-export async function createHashlineHooks(input, { toolFactory } = {}) {
+export async function createHashlineHooks(input, { toolFactory, store = processStore } = {}) {
   const createTool = toolFactory ?? (await hostTool())
   const worktree = input.worktree ?? input.directory
   const service = new HashlineService({
     worktree,
     directory: input.directory ?? worktree,
-    store: processStore,
+    store,
   })
 
   return {
@@ -116,4 +116,3 @@ export async function createHashlineHooks(input, { toolFactory } = {}) {
 export const HashlinePlugin = async (input, options) => createHashlineHooks(input, options)
 
 export default HashlinePlugin
-
