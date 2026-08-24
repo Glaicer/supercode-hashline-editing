@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@glaicer/supercode-hashline-editing",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenCode plugin for capability-bound hashline read/edit operations",
+  "type": "module",
+  "main": "./plugin/hashline.js",
+  "exports": {
+    ".": "./plugin/hashline.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
