@@ -65,13 +65,14 @@ function serializableEditResult(result) {
 
 export async function createHashlineHooks(
   input,
-  { toolFactory, store = processStore, enforceSeenLines = true } = {},
+  { toolFactory, store = processStore, filesystem, enforceSeenLines = true } = {},
 ) {
   const createTool = toolFactory ?? (await hostTool())
   const worktree = input.worktree ?? input.directory
   const service = new HashlineService({
     worktree,
     directory: input.directory ?? worktree,
+    filesystem,
     store,
     enforceSeenLines,
   })
@@ -97,7 +98,7 @@ export async function createHashlineHooks(
       }),
       edit: createTool({
         description:
-          "Apply a hashline patch containing [PATH#TAG] and replace N-M / replace N / insert before N / insert after N / append hunks. Use the TAG from hashline read; edit only existing files and NEVER format or restyle code.",
+          "Apply a hashline patch containing one or more [PATH#TAG] sections and replace N-M / replace N / insert before N / insert after N / append hunks. Use the TAG from hashline read; edit only existing files and NEVER format or restyle code. Preparation is preflight atomic; each file commits atomically; cross-file rollback is best effort and reported.",
         args: {
           patch: createTool.schema.string().describe("Hashline patch text"),
         },

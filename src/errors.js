@@ -50,9 +50,22 @@ export class DuplicateHunkError extends HashlineError {
   }
 }
 
+export class DuplicatePathError extends HashlineError {
+  constructor({ canonicalPath, paths }) {
+    super(
+      `Multiple patch sections resolve to the same canonical path ${canonicalPath}: ${paths.join(
+        ", ",
+      )}`,
+    )
+    this.name = "DuplicatePathError"
+    this.canonicalPath = canonicalPath
+    this.paths = paths
+  }
+}
+
 export class NoChangesError extends HashlineError {
-  constructor() {
-    super("edit resulted in no changes")
+  constructor(path) {
+    super(path ? `edit for ${path} resulted in no changes` : "edit resulted in no changes")
     this.name = "NoChangesError"
   }
 }

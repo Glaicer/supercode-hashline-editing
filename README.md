@@ -32,3 +32,8 @@ replace 2-3
 
 Reads accept optional `limit` and `offset` windows. Inserts use `insert before N`,
 `insert after N`, or `append`; all anchors use the original Snapshot line numbers.
+
+A patch may contain multiple `[PATH#TAG]` sections. All sections pass preflight
+validation before any target is changed; each file commits atomically, while
+cross-file rollback is best effort and reported as `written`, `rolledBack`, and
+`partiallyWritten`.

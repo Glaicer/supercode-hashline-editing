@@ -57,10 +57,11 @@ function decodeBytes(bytes) {
 
 /** Filesystem adapter with realpath-based Snapshot Root confinement. */
 export class FileSystemAdapter {
-  constructor({ root, roots = [] }) {
+  constructor({ root, roots = [], rename: renameOperation } = {}) {
     this.root = path.resolve(root)
     this.extraRoots = roots.map((candidate) => path.resolve(candidate))
     this._rootsPromise = null
+    this.renameFile = renameOperation ?? rename
   }
 
   async _snapshotRoots() {
@@ -137,10 +138,8 @@ export class FileSystemAdapter {
     return decodeBytes(bytes)
   }
 
-  /**
-   * Commit a normalized text replacement using tmp → fsync → revalidate → rename.
-   */
-  async writeAtomic({
+  /** Stage a normalized replacement without changing the target file. */
+  async prepareAtomic({
     inputPath,
     baseDirectory = this.root,
     canonicalPath,
@@ -164,23 +163,30 @@ export class FileSystemAdapter {
     )
     const persistedText = restoreLineEndings(newText, lineEnding, bom)
     let handle
+    let staged = false
+    let operationError
     try {
       handle = await open(temporaryPath, "wx")
       await handle.writeFile(persistedText, "utf8")
       await handle.sync()
       await handle.close()
       handle = undefined
-
-      if (beforeRename) await beforeRename()
-
-      const current = await this.resolve(inputPath, baseDirectory)
-      if (current.canonicalPath !== canonicalPath || current.rootId !== rootId) throw new PathBoundaryError()
-      const liveBeforeRename = await this._readNormalized(current)
-      if (liveBeforeRename.text !== expectedText) throw new LiveFileChangedError()
-
-      await rename(temporaryPath, canonicalPath)
-      return { persistedText, canonicalPath, rootId }
+      staged = true
+      return {
+        inputPath,
+        baseDirectory,
+        canonicalPath,
+        rootId,
+        expectedText,
+        newText,
+        lineEnding,
+        bom,
+        persistedText,
+        temporaryPath,
+        beforeRename,
+      }
     } catch (error) {
+      operationError = error
       if (handle) {
         try {
           await handle.close()
@@ -188,7 +194,97 @@ export class FileSystemAdapter {
       }
       throw error
     } finally {
-      await rm(temporaryPath, { force: true }).catch(() => {})
+      if (!staged) {
+        try {
+          await rm(temporaryPath, { force: true })
+        } catch (cleanupError) {
+          if (operationError) operationError.cleanupError = cleanupError
+          else throw cleanupError
+        }
+      }
     }
+  }
+
+  async discardPrepared(prepared) {
+    if (!prepared?.temporaryPath) return
+    try {
+      await rm(prepared.temporaryPath, { force: true })
+    } catch (error) {
+      error.temporaryPath = prepared.temporaryPath
+      throw error
+    }
+  }
+
+  /** Revalidate a staged replacement immediately before its rename. */
+  async commitPrepared(prepared) {
+    let operationError
+    let result
+    try {
+      if (prepared.beforeRename) await prepared.beforeRename()
+      const current = await this.resolve(prepared.inputPath, prepared.baseDirectory)
+      if (current.canonicalPath !== prepared.canonicalPath || current.rootId !== prepared.rootId) {
+        throw new PathBoundaryError()
+      }
+      const liveBeforeRename = await this._readNormalized(current)
+      if (liveBeforeRename.text !== prepared.expectedText) throw new LiveFileChangedError()
+
+      await this.renameFile(prepared.temporaryPath, prepared.canonicalPath)
+      result = {
+        persistedText: prepared.persistedText,
+        canonicalPath: prepared.canonicalPath,
+        rootId: prepared.rootId,
+      }
+    } catch (error) {
+      operationError = error
+    }
+
+    try {
+      await this.discardPrepared(prepared)
+    } catch (cleanupError) {
+      if (operationError) {
+        operationError.cleanupError = cleanupError
+      } else {
+        operationError = cleanupError
+        operationError.committed = true
+        operationError.persistedText = prepared.persistedText
+        operationError.canonicalPath = prepared.canonicalPath
+        operationError.rootId = prepared.rootId
+      }
+    }
+
+    if (operationError) throw operationError
+    return result
+  }
+
+  /** Restore a pre-image using the same staged tmp → fsync → rename path. */
+  async restoreAtomic({
+    inputPath,
+    baseDirectory = this.root,
+    canonicalPath,
+    rootId,
+    expectedText,
+    newText,
+    lineEnding,
+    bom,
+  }) {
+    const prepared = await this.prepareAtomic({
+      inputPath,
+      baseDirectory,
+      canonicalPath,
+      rootId,
+      expectedText,
+      newText,
+      lineEnding,
+      bom,
+    })
+    return this.commitPrepared(prepared)
+  }
+
+  /**
+   * Commit one normalized text replacement using tmp → fsync → revalidate → rename.
+   */
+  async writeAtomic({ beforeRename, ...input }) {
+    const prepared = await this.prepareAtomic({ ...input, beforeRename })
+    return this.commitPrepared(prepared)
   }
 }

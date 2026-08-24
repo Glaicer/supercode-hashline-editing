@@ -1,10 +1,12 @@
 import { test, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rename as renameFile, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 
 import HashlinePlugin, { createHashlineHooks } from "../plugin/hashline.js"
+import { FileSystemAdapter } from "../src/filesystem.js"
+import { DuplicatePathError } from "../src/service.js"
 import { computeTag } from "../src/hash.js"
 import { InMemorySnapshotStore } from "../src/snapshots.js"
 
@@ -92,6 +94,165 @@ test("plugin applies insert before, insert after, and append hunks", async () =>
   )
 
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "zero\none\ntwo\nbetween\nthree\n")
+})
+
+test("plugin applies a multi-section patch to two files", async () => {
+  await writeFile(path.join(root, "b.ts"), "alpha\nbeta\n")
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  const aReading = await hooks.tool.read.execute({ path: "a.ts" }, {})
+  const bReading = await hooks.tool.read.execute({ path: "b.ts" }, {})
+  const aHeader = aReading.output.split("\n")[0]
+  const bHeader = bReading.output.split("\n")[0]
+
+  const result = await hooks.tool.edit.execute(
+    {
+      patch: [
+        aHeader,
+        "replace 1",
+        "+ONE",
+        bHeader,
+        "replace 2",
+        "+BETA",
+      ].join("\n"),
+    },
+    {},
+  )
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "ONE\ntwo\n")
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "alpha\nBETA\n")
+  assert.equal(result.metadata.sections.length, 2)
+  assert.deepEqual(result.metadata.written, [path.join(root, "a.ts"), path.join(root, "b.ts")])
+  assert.deepEqual(result.metadata.rolledBack, [])
+  assert.deepEqual(result.metadata.partiallyWritten, [])
+})
+
+test("plugin preflights every section before writing any file", async () => {
+  await writeFile(path.join(root, "b.ts"), "alpha\nbeta\n")
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  const aReading = await hooks.tool.read.execute({ path: "a.ts" }, {})
+  const bReading = await hooks.tool.read.execute({ path: "b.ts" }, {})
+  const aHeader = aReading.output.split("\n")[0]
+  const bHeader = bReading.output.split("\n")[0]
+  await writeFile(path.join(root, "b.ts"), "changed\nbeta\n")
+
+  await assert.rejects(
+    hooks.tool.edit.execute(
+      {
+        patch: [aHeader, "replace 1", "+ONE", bHeader, "replace 1", "+ALPHA"].join("\n"),
+      },
+      {},
+    ),
+    (error) => {
+      assert.equal(error.path, "b.ts")
+      assert.deepEqual(error.written, [])
+      assert.deepEqual(error.rolledBack, [])
+      assert.deepEqual(error.partiallyWritten, [])
+      assert.match(error.message, /b\.ts/)
+      return /re-read/i.test(error.message)
+    },
+  )
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "changed\nbeta\n")
+})
+
+test("plugin rolls back earlier sections when a later rename fails", async () => {
+  await writeFile(path.join(root, "b.ts"), "alpha\nbeta\n")
+  let renameCount = 0
+  const filesystem = new FileSystemAdapter({
+    root,
+    rename: async (...args) => {
+      renameCount += 1
+      if (renameCount === 2) throw new Error("injected rename 2 failure")
+      return renameFile(...args)
+    },
+  })
+  const hooks = await HashlinePlugin({ worktree: root, directory: root }, { filesystem })
+  const aHeader = (await hooks.tool.read.execute({ path: "a.ts" }, {})).output.split("\n")[0]
+  const bHeader = (await hooks.tool.read.execute({ path: "b.ts" }, {})).output.split("\n")[0]
+
+  await assert.rejects(
+    hooks.tool.edit.execute(
+      {
+        patch: [aHeader, "replace 1", "+ONE", bHeader, "replace 1", "+ALPHA"].join("\n"),
+      },
+      {},
+    ),
+    (error) => {
+      assert.deepEqual(error.written, [path.join(root, "a.ts")])
+      assert.deepEqual(error.rolledBack, [path.join(root, "a.ts")])
+      assert.deepEqual(error.partiallyWritten, [])
+      assert.match(error.message, /a\.ts|b\.ts/)
+      return /injected rename 2 failure/.test(error.message)
+    },
+  )
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "alpha\nbeta\n")
+  assert.deepEqual((await readdir(root)).sort(), ["a.ts", "b.ts"])
+})
+
+test("plugin reports a partial write when rollback fails", async () => {
+  await writeFile(path.join(root, "b.ts"), "alpha\nbeta\n")
+  let renameCount = 0
+  const filesystem = new FileSystemAdapter({
+    root,
+    rename: async (...args) => {
+      renameCount += 1
+      if (renameCount === 2 || renameCount === 3) throw new Error(`injected rename ${renameCount} failure`)
+      return renameFile(...args)
+    },
+  })
+  const hooks = await HashlinePlugin({ worktree: root, directory: root }, { filesystem })
+  const aHeader = (await hooks.tool.read.execute({ path: "a.ts" }, {})).output.split("\n")[0]
+  const bHeader = (await hooks.tool.read.execute({ path: "b.ts" }, {})).output.split("\n")[0]
+
+  await assert.rejects(
+    hooks.tool.edit.execute(
+      {
+        patch: [aHeader, "replace 1", "+ONE", bHeader, "replace 1", "+ALPHA"].join("\n"),
+      },
+      {},
+    ),
+    (error) => {
+      assert.deepEqual(error.written, [path.join(root, "a.ts")])
+      assert.deepEqual(error.rolledBack, [])
+      assert.deepEqual(error.partiallyWritten, [path.join(root, "a.ts")])
+      assert.deepEqual(error.unwritten, [path.join(root, "b.ts")])
+      assert.match(error.message, /a\.ts/)
+      assert.match(error.message, /b\.ts/)
+      return /injected rename 2 failure/.test(error.message)
+    },
+  )
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "ONE\ntwo\n")
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "alpha\nbeta\n")
+  assert.deepEqual((await readdir(root)).sort(), ["a.ts", "b.ts"])
+})
+
+test("plugin rejects sections that resolve to one canonical path", async () => {
+  await symlink(path.join(root, "a.ts"), path.join(root, "alias.ts"))
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  const aHeader = (await hooks.tool.read.execute({ path: "a.ts" }, {})).output.split("\n")[0]
+  const aliasHeader = (await hooks.tool.read.execute({ path: "alias.ts" }, {})).output.split("\n")[0]
+
+  await assert.rejects(
+    hooks.tool.edit.execute(
+      {
+        patch: [aHeader, "replace 1", "+ONE", aliasHeader, "replace 2", "+TWO"].join("\n"),
+      },
+      {},
+    ),
+    (error) => {
+      assert.ok(error instanceof DuplicatePathError)
+      assert.equal(error.canonicalPath, path.join(root, "a.ts"))
+      assert.deepEqual(error.written, [])
+      return /a\.ts|alias\.ts/.test(error.message)
+    },
+  )
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+  assert.deepEqual((await readdir(root)).sort(), ["a.ts", "alias.ts"])
 })
 
 test("plugin exposes an unseen-anchor preview and accepts a complete retry", async () => {

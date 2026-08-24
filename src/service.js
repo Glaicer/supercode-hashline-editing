@@ -4,12 +4,14 @@ import {
   computeTag,
   formatNumberedLines,
   normalizeToLF,
+  restoreLineEndings,
   splitAddressableLines,
   stripBom,
 } from "./hash.js"
 import {
   BoundaryError,
   DuplicateHunkError,
+  DuplicatePathError,
   HashlineError,
   LineRangeError,
   MismatchError,
@@ -213,6 +215,35 @@ function formatHeader(filePath, tag) {
   return `[${filePath}#${tag}]`
 }
 
+function uniquePaths(paths) {
+  return [...new Set(paths)]
+}
+
+function makeCommitReport(paths, written = [], rolledBack = [], partiallyWritten = []) {
+  const knownPaths = uniquePaths(paths)
+  const forwardWritten = uniquePaths(written)
+  const restored = uniquePaths(rolledBack)
+  const partial = uniquePaths(partiallyWritten)
+  const writtenSet = new Set(forwardWritten)
+  return {
+    written: forwardWritten,
+    rolledBack: restored,
+    partiallyWritten: partial,
+    unwritten: knownPaths.filter((candidate) => !writtenSet.has(candidate)),
+  }
+}
+
+function attachCommitReport(error, report, rollbackErrors = []) {
+  Object.assign(error, report, { report, rollbackErrors })
+  const formatPaths = (paths) => (paths.length === 0 ? "none" : paths.join(", "))
+  error.message = `${error.message}; hashline commit report: written=[${formatPaths(
+    report.written,
+  )}], rolledBack=[${formatPaths(report.rolledBack)}], partiallyWritten=[${formatPaths(
+    report.partiallyWritten,
+  )}], notWritten=[${formatPaths(report.unwritten)}]`
+  return error
+}
+
 /** Main public read/edit seam for the foundation ticket. */
 export class HashlineService {
   constructor({
@@ -280,14 +311,7 @@ export class HashlineService {
     }
   }
 
-  async edit(patch) {
-    const parsed = parsePatch(patch)
-    if (parsed.sections.length !== 1) {
-      throw new HashlineError("multiple sections are reserved for the multi-section commit ticket")
-    }
-
-    const section = parsed.sections[0]
-    const file = await this._readFile(section.path, "edit")
+  _resolveSnapshot(section, file) {
     const capability = this.readCapabilities.get(capabilityKey(section.path, file.rootId))
     if (capability && capability !== file.canonicalPath) {
       throw new MismatchError({
@@ -297,13 +321,13 @@ export class HashlineService {
         reason: "the read path now resolves to a different file",
       })
     }
+
     const { candidates, exact } = this.store.exactMatches(
       file.canonicalPath,
       file.rootId,
       section.tag,
       file.text,
     )
-
     if (candidates.length === 0) {
       const retained = this.store.find(file.canonicalPath, file.rootId)
       const wasRead = this.readCapabilities.has(capabilityKey(section.path, file.rootId))
@@ -322,7 +346,11 @@ export class HashlineService {
       })
     }
 
-    const snapshot = exact[0]
+    return exact[0]
+  }
+
+  _prepareSection(section, file) {
+    const snapshot = this._resolveSnapshot(section, file)
     const lines = splitAddressableLines(snapshot.text)
     validateHunks(lines, section.hunks)
     if (this.enforceSeenLines) {
@@ -341,8 +369,9 @@ export class HashlineService {
         })
       }
     }
+
     const applied = applyReplacements(snapshot.text, section.hunks)
-    if (applied.after === snapshot.text) throw new NoChangesError()
+    if (applied.after === snapshot.text) throw new NoChangesError(section.path)
 
     const nextSnapshotInput = {
       canonicalPath: file.canonicalPath,
@@ -353,46 +382,188 @@ export class HashlineService {
       bom: snapshot.bom,
     }
     this.store.assertCanRecord(nextSnapshotInput)
+    return { section, file, snapshot, applied, nextSnapshotInput }
+  }
 
-    let committed
+  async _discardPrepared(prepared) {
+    if (typeof this.filesystem.discardPrepared !== "function") return []
+    const cleanupErrors = []
+    for (const item of prepared) {
+      try {
+        await this.filesystem.discardPrepared(item)
+      } catch (error) {
+        cleanupErrors.push(error)
+      }
+    }
+    return cleanupErrors
+  }
+
+  async _commitPlans(plans) {
+    const paths = plans.map((plan) => plan.file.canonicalPath)
+    const prepared = []
+
     try {
-      committed = await this.filesystem.writeAtomic({
-        inputPath: section.path,
-        baseDirectory: this.directory,
-        canonicalPath: file.canonicalPath,
-        rootId: file.rootId,
-        expectedText: snapshot.text,
-        newText: applied.after,
-        lineEnding: snapshot.lineEnding,
-        bom: snapshot.bom,
-      })
+      for (const plan of plans) {
+        try {
+          if (typeof this.filesystem.prepareAtomic !== "function") {
+            throw new HashlineError("filesystem does not support staged hashline commits")
+          }
+          prepared.push(
+            await this.filesystem.prepareAtomic({
+              inputPath: plan.section.path,
+              baseDirectory: this.directory,
+              canonicalPath: plan.file.canonicalPath,
+              rootId: plan.file.rootId,
+              expectedText: plan.snapshot.text,
+              newText: plan.applied.after,
+              lineEnding: plan.snapshot.lineEnding,
+              bom: plan.snapshot.bom,
+            }),
+          )
+        } catch (error) {
+          throw mapFilesystemError(error, "edit", plan.section.path)
+        }
+      }
     } catch (error) {
-      throw mapFilesystemError(error, "edit", section.path)
+      const cleanupErrors = await this._discardPrepared(prepared)
+      if (cleanupErrors.length > 0) error.cleanupErrors = cleanupErrors
+      throw attachCommitReport(error, makeCommitReport(paths))
     }
 
-    const written = normalizeToLF(stripBom(committed.persistedText))
-    const nextSnapshot = this.store.record({ ...nextSnapshotInput, text: written })
-    const header = formatHeader(section.path, nextSnapshot.tag)
-    const sectionResult = {
-      path: section.path,
-      canonicalPath: file.canonicalPath,
-      op: "update",
-      before: snapshot.text,
-      after: applied.after,
-      persisted: committed.persistedText,
-      written: committed.persistedText,
-      tag: nextSnapshot.tag,
-      fileHash: nextSnapshot.tag,
-      header,
-      firstChangedLine: applied.firstChangedLine,
-      warnings: [],
+    const forward = []
+    try {
+      for (let index = 0; index < plans.length; index += 1) {
+        const plan = plans[index]
+        try {
+          if (typeof this.filesystem.commitPrepared !== "function") {
+            throw new HashlineError("filesystem does not support staged hashline commits")
+          }
+          const committed = await this.filesystem.commitPrepared(prepared[index])
+          forward.push({ plan, committed })
+        } catch (error) {
+          const mapped = mapFilesystemError(error, "edit", plan.section.path)
+          if (mapped.committed) forward.push({ plan, committed: mapped })
+          throw mapped
+        }
+      }
+    } catch (error) {
+      const rolledBack = []
+      const partiallyWritten = []
+      const rollbackErrors = []
+
+      for (const { plan } of forward) {
+        try {
+          if (typeof this.filesystem.restoreAtomic !== "function") {
+            throw new HashlineError("filesystem does not support hashline rollback")
+          }
+          await this.filesystem.restoreAtomic({
+            inputPath: plan.section.path,
+            baseDirectory: this.directory,
+            canonicalPath: plan.file.canonicalPath,
+            rootId: plan.file.rootId,
+            expectedText: plan.applied.after,
+            newText: plan.snapshot.text,
+            lineEnding: plan.snapshot.lineEnding,
+            bom: plan.snapshot.bom,
+          })
+          rolledBack.push(plan.file.canonicalPath)
+        } catch (rollbackError) {
+          partiallyWritten.push(plan.file.canonicalPath)
+          rollbackErrors.push({ path: plan.file.canonicalPath, error: rollbackError })
+        }
+      }
+
+      const cleanupErrors = await this._discardPrepared(prepared)
+      if (cleanupErrors.length > 0) error.cleanupErrors = cleanupErrors
+      throw attachCommitReport(
+        error,
+        makeCommitReport(
+          paths,
+          forward.map(({ plan }) => plan.file.canonicalPath),
+          rolledBack,
+          partiallyWritten,
+        ),
+        rollbackErrors,
+      )
     }
-    return {
-      ...sectionResult,
-      sections: [sectionResult],
-      written: [file.canonicalPath],
-      rolledBack: [],
-      partiallyWritten: [],
+
+    const cleanupErrors = await this._discardPrepared(prepared)
+    if (cleanupErrors.length > 0) {
+      const cleanupError = cleanupErrors[0]
+      cleanupError.cleanupErrors = cleanupErrors
+      throw attachCommitReport(cleanupError, makeCommitReport(paths, paths))
+    }
+    try {
+      const sectionResults = []
+      for (const { plan, committed } of forward) {
+        const persisted =
+          committed?.persistedText ??
+          restoreLineEndings(plan.applied.after, plan.snapshot.lineEnding, plan.snapshot.bom)
+        const writtenText = normalizeToLF(stripBom(persisted))
+        const nextSnapshot = this.store.record({ ...plan.nextSnapshotInput, text: writtenText })
+        sectionResults.push({
+          path: plan.section.path,
+          canonicalPath: plan.file.canonicalPath,
+          op: "update",
+          before: plan.snapshot.text,
+          after: plan.applied.after,
+          persisted,
+          written: persisted,
+          tag: nextSnapshot.tag,
+          fileHash: nextSnapshot.tag,
+          header: formatHeader(plan.section.path, nextSnapshot.tag),
+          firstChangedLine: plan.applied.firstChangedLine,
+          warnings: [],
+        })
+      }
+      return {
+        sections: sectionResults,
+        written: [...paths],
+        rolledBack: [],
+        partiallyWritten: [],
+      }
+    } catch (error) {
+      throw attachCommitReport(error, makeCommitReport(paths, paths))
+    }
+  }
+
+  async edit(patch) {
+    let parsed
+    try {
+      parsed = parsePatch(patch)
+    } catch (error) {
+      throw attachCommitReport(error, makeCommitReport([]))
+    }
+    const sections = parsed.sections
+    const resolved = []
+
+    try {
+      for (const section of sections) {
+        const file = await this._readFile(section.path, "edit")
+        resolved.push({ section, file })
+      }
+
+      const byCanonicalPath = new Map()
+      for (const { section, file } of resolved) {
+        const previous = byCanonicalPath.get(file.canonicalPath)
+        if (previous) {
+          throw new DuplicatePathError({
+            canonicalPath: file.canonicalPath,
+            paths: [previous.section.path, section.path],
+          })
+        }
+        byCanonicalPath.set(file.canonicalPath, { section, file })
+      }
+
+      const plans = resolved.map(({ section, file }) => this._prepareSection(section, file))
+      return await this._commitPlans(plans)
+    } catch (error) {
+      if (error.report) throw error
+      const reportPaths = uniquePaths([
+        ...resolved.map(({ file }) => file.canonicalPath),
+        ...sections.slice(resolved.length).map((section) => section.path),
+      ])
+      throw attachCommitReport(error, makeCommitReport(reportPaths))
     }
   }
 }
@@ -400,6 +571,7 @@ export class HashlineService {
 export { applyReplacements }
 export {
   BoundaryError,
+  DuplicatePathError,
   LineRangeError,
   MissingFileError,
   MismatchError,

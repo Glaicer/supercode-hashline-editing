@@ -6,6 +6,7 @@ import path from "node:path"
 
 import {
   BoundaryError,
+  DuplicatePathError,
   HashlineService,
   LineRangeError,
   MissingFileError,
@@ -185,6 +186,73 @@ test("stale content fails before writing and asks for a re-read", async () => {
     (error) => error instanceof MismatchError && /re-read/i.test(error.message),
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "changed\ntwo\nthree\n")
+})
+
+test("multi-section preflight rejects a stale later file before writing the first", async () => {
+  await writeFile(path.join(root, "b.ts"), "alpha\nbeta\n")
+  const aReading = await service.read("a.ts")
+  const bReading = await service.read("b.ts")
+  await writeFile(path.join(root, "b.ts"), "changed\nbeta\n")
+
+  await assert.rejects(
+    service.edit(
+      [
+        aReading.header,
+        "replace 1",
+        "+ONE",
+        bReading.header,
+        "replace 1",
+        "+ALPHA",
+      ].join("\n"),
+    ),
+    (error) => {
+      assert.equal(error.path, "b.ts")
+      assert.deepEqual(error.written, [])
+      assert.deepEqual(error.rolledBack, [])
+      assert.deepEqual(error.partiallyWritten, [])
+      return true
+    },
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
+})
+
+test("multi-section preflight rejects duplicate canonical paths", async () => {
+  const link = path.join(root, "link.ts")
+  await symlink(path.join(root, "a.ts"), link)
+  const aReading = await service.read("a.ts")
+  const linkReading = await service.read("link.ts")
+
+  await assert.rejects(
+    service.edit(
+      [
+        aReading.header,
+        "replace 1",
+        "+ONE",
+        linkReading.header,
+        "replace 2",
+        "+TWO",
+      ].join("\n"),
+    ),
+    (error) => {
+      assert.ok(error instanceof DuplicatePathError)
+      assert.equal(error.canonicalPath, path.join(root, "a.ts"))
+      assert.deepEqual(error.written, [])
+      return true
+    },
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
+})
+
+test("syntax failures still carry an empty commit report", async () => {
+  await assert.rejects(
+    service.edit("not a hashline patch"),
+    (error) => {
+      assert.deepEqual(error.written, [])
+      assert.deepEqual(error.rolledBack, [])
+      assert.deepEqual(error.partiallyWritten, [])
+      return true
+    },
+  )
 })
 
 test("edit requires a Snapshot minted by read", async () => {
