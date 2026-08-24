@@ -10,6 +10,7 @@ import {
   LineRangeError,
   MissingFileError,
   MismatchError,
+  SeenLinesError,
   SnapshotRequiredError,
 } from "../src/service.js"
 import { computeTag } from "../src/hash.js"
@@ -50,6 +51,129 @@ test("read returns a tagged header and numbered lines, then replace returns a ne
   assert.deepEqual(result.rolledBack, [])
   assert.deepEqual(result.partiallyWritten, [])
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "ONE\nTWO\nthree\n")
+})
+
+test("applies insert before, insert after, and append using original line numbers", async () => {
+  const reading = await service.read("a.ts")
+
+  const result = await service.edit([
+    reading.header,
+    "insert before 1",
+    "+zero",
+    "insert after 2",
+    "+between",
+    "append",
+    "+four",
+  ].join("\n"))
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "zero\none\ntwo\nbetween\nthree\nfour\n")
+  assert.equal(result.sections[0].firstChangedLine, 1)
+})
+
+test("insert before 1 can add the first line to an empty file", async () => {
+  await writeFile(path.join(root, "a.ts"), "")
+  const reading = await service.read("a.ts")
+
+  const result = await service.edit(`${reading.header}\ninsert before 1\n+head`)
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "head")
+  assert.equal(result.sections[0].firstChangedLine, 1)
+})
+
+test("insert bodies use the same literal prefix rules as replacements", async () => {
+  const reading = await service.read("a.ts")
+
+  await service.edit([
+    reading.header,
+    "insert before 2",
+    "+- item",
+    "++ item",
+    "+",
+  ].join("\n"))
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\n- item\n+ item\n\ntwo\nthree\n")
+})
+
+test("windowed reads union the shown lines into one tagged snapshot", async () => {
+  const first = await service.read("a.ts", 1, 1)
+  const second = await service.read("a.ts", 1, 3)
+
+  assert.equal(first.numbered, "1:one")
+  assert.equal(second.numbered, "3:three")
+  assert.equal(first.tag, second.tag)
+  assert.deepEqual(second.seenLines, [1, 3])
+})
+
+test("unseen anchors reveal a bounded preview and allow a retry when complete", async () => {
+  await writeFile(path.join(root, "a.ts"), Array.from({ length: 10 }, (_, index) => `line-${index + 1}`).join("\n") + "\n")
+  const reading = await service.read("a.ts", 2)
+  const patch = `${reading.header}\nreplace 9\n+changed`
+
+  await assert.rejects(service.edit(patch), (error) => {
+    assert.ok(error instanceof SeenLinesError)
+    assert.deepEqual(error.revealed, [{ line: 9, text: "line-9" }])
+    assert.equal(error.truncated, false)
+    return true
+  })
+
+  const result = await service.edit(patch)
+  assert.equal(result.sections[0].firstChangedLine, 9)
+  assert.equal((await readFile(path.join(root, "a.ts"), "utf8")).split("\n")[8], "changed")
+})
+
+test("long or over-cap previews stay truncated and do not authorize a retry", async () => {
+  const longLine = "x".repeat(513)
+  await writeFile(path.join(root, "a.ts"), `one\n${longLine}\nthree\n`)
+  const reading = await service.read("a.ts", 1)
+  const patch = `${reading.header}\nreplace 2\n+changed`
+
+  await assert.rejects(service.edit(patch), (error) => {
+    assert.ok(error instanceof SeenLinesError)
+    assert.equal(error.truncated, true)
+    assert.equal(error.revealed[0].text.length, 512)
+    assert.equal(error.revealed[0].text.at(-1), "…")
+    return true
+  })
+  await assert.rejects(service.edit(patch), (error) => error instanceof SeenLinesError)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), `one\n${longLine}\nthree\n`)
+})
+
+test("reveal previews cap at forty missing lines", async () => {
+  await writeFile(
+    path.join(root, "a.ts"),
+    Array.from({ length: 50 }, (_, index) => `line-${index + 1}`).join("\n") + "\n",
+  )
+  const reading = await service.read("a.ts", 1)
+  const patch = `${reading.header}\nreplace 2-42\n+changed`
+
+  await assert.rejects(service.edit(patch), (error) => {
+    assert.ok(error instanceof SeenLinesError)
+    assert.equal(error.revealed.length, 40)
+    assert.equal(error.revealed[0].line, 2)
+    assert.equal(error.revealed.at(-1).line, 41)
+    assert.equal(error.truncated, true)
+    return true
+  })
+  await assert.rejects(service.edit(patch), (error) => error instanceof SeenLinesError)
+})
+
+test("enforceSeenLines false leaves snapshot freshness checks enabled but skips the visibility guard", async () => {
+  const unenforced = new HashlineService({ worktree: root, directory: root, enforceSeenLines: false })
+  const reading = await unenforced.read("a.ts", 1)
+
+  await unenforced.edit(`${reading.header}\nreplace 3\n+THREE`)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nTHREE\n")
+})
+
+test("a new tag keeps the prior snapshot visibility after an edit", async () => {
+  const reading = await service.read("a.ts", 1)
+  const result = await service.edit(`${reading.header}\nreplace 1\n+ONE`)
+  const nextHeader = result.sections[0].header
+
+  await assert.rejects(
+    service.edit(`${nextHeader}\nreplace 3\n+THREE`),
+    (error) => error instanceof SeenLinesError,
+  )
 })
 
 test("stale content fails before writing and asks for a re-read", async () => {

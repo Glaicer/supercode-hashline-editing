@@ -15,6 +15,7 @@ import {
   MismatchError,
   MissingFileError,
   NoChangesError,
+  SeenLinesError,
   SnapshotRequiredError,
 } from "./errors.js"
 import {
@@ -39,31 +40,173 @@ function mapFilesystemError(error, operation, displayPath) {
   return error
 }
 
-function applyReplacements(text, hunks) {
-  const lines = splitAddressableLines(text)
-  const lineCount = lines.length
-  const ordered = [...hunks].sort((left, right) => left.start - right.start || left.end - right.end)
+export const SEEN_LINE_REVEAL_CAP = 40
+export const SEEN_LINE_REVEAL_MAX_COLUMNS = 512
 
-  for (const hunk of ordered) {
-    if (hunk.start < 1 || hunk.end > lineCount) {
-      const missingLine = hunk.start > lineCount ? hunk.start : hunk.end
-      throw new LineRangeError(missingLine, lineCount)
+function validateHunks(lines, hunks) {
+  const lineCount = lines.length
+
+  for (const hunk of hunks) {
+    if (hunk.operation === "replace") {
+      if (hunk.start < 1 || hunk.end > lineCount) {
+        const missingLine = hunk.start > lineCount ? hunk.start : hunk.end
+        throw new LineRangeError(missingLine, lineCount)
+      }
+      continue
+    }
+
+    if (hunk.operation === "insert" && hunk.placement === "before") {
+      if (hunk.line !== 1 && (hunk.line < 1 || hunk.line > lineCount)) {
+        throw new LineRangeError(hunk.line, lineCount)
+      }
+      continue
+    }
+
+    if (hunk.operation === "insert" && hunk.placement === "after") {
+      if (hunk.line < 1 || hunk.line > lineCount) throw new LineRangeError(hunk.line, lineCount)
     }
   }
-  for (let index = 1; index < ordered.length; index += 1) {
-    if (ordered[index].start <= ordered[index - 1].end) throw new DuplicateHunkError()
+
+  const replacements = hunks
+    .filter((hunk) => hunk.operation === "replace")
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+  for (let index = 1; index < replacements.length; index += 1) {
+    if (replacements[index].start <= replacements[index - 1].end) throw new DuplicateHunkError()
   }
 
-  const hadTerminalNewline = text.endsWith("\n")
-  const result = [...lines]
-  for (const hunk of [...ordered].reverse()) {
-    result.splice(hunk.start - 1, hunk.end - hunk.start + 1, ...hunk.body)
+  return { lineCount, replacements }
+}
+
+function appendHunks(target, hunks) {
+  for (const hunk of hunks) target.push(...hunk.body)
+}
+
+function indexHunks(hunks, replacements) {
+  const replacementByStart = new Map(replacements.map((hunk) => [hunk.start, hunk]))
+  const before = new Map()
+  const after = new Map()
+  const append = []
+
+  for (const hunk of hunks) {
+    if (hunk.operation !== "insert") continue
+    if (hunk.placement === "append") {
+      append.push(hunk)
+      continue
+    }
+    const destination = hunk.placement === "before" ? before : after
+    const existing = destination.get(hunk.line) ?? []
+    existing.push(hunk)
+    destination.set(hunk.line, existing)
   }
+
+  return { replacementByStart, before, after, append }
+}
+
+function changedLineForHunk(hunk, lineCount) {
+  if (hunk.operation === "replace") return hunk.start
+  if (hunk.placement === "before") return hunk.line
+  if (hunk.placement === "after") return hunk.line + 1
+  return lineCount + 1
+}
+
+function applyReplacements(text, hunks) {
+  const lines = splitAddressableLines(text)
+  const { lineCount, replacements } = validateHunks(lines, hunks)
+  const { replacementByStart, before, after: afterLines, append } = indexHunks(hunks, replacements)
+
+  const hadTerminalNewline = text.endsWith("\n")
+  const result = []
+  let replacedThrough = 0
+  if (lineCount === 0) appendHunks(result, before.get(1) ?? [])
+  for (let line = 1; line <= lineCount; line += 1) {
+    appendHunks(result, before.get(line) ?? [])
+
+    const replacement = replacementByStart.get(line)
+    if (replacement) {
+      result.push(...replacement.body)
+      replacedThrough = replacement.end
+    } else if (line > replacedThrough) {
+      result.push(lines[line - 1])
+    }
+
+    appendHunks(result, afterLines.get(line) ?? [])
+  }
+
+  appendHunks(result, append)
   const after = result.join("\n") + (hadTerminalNewline ? "\n" : "")
+  const firstChangedLine = hunks.reduce(
+    (first, hunk) => Math.min(first, changedLineForHunk(hunk, lineCount)),
+    Number.POSITIVE_INFINITY,
+  )
   return {
     after,
-    firstChangedLine: ordered.length > 0 ? ordered[0].start : undefined,
+    firstChangedLine: Number.isFinite(firstChangedLine) ? firstChangedLine : undefined,
   }
+}
+
+function recordHunkLines(seenLines, hunks, outputLine) {
+  for (const hunk of hunks) {
+    for (let index = 0; index < hunk.body.length; index += 1) seenLines.add(outputLine + index)
+    outputLine += hunk.body.length
+  }
+  return outputLine
+}
+
+function mapSeenLinesAfterEdit(snapshot, hunks) {
+  const lines = splitAddressableLines(snapshot.text)
+  const { lineCount, replacements } = validateHunks(lines, hunks)
+  const { replacementByStart, before, after: afterLines, append } = indexHunks(hunks, replacements)
+  const seenLines = new Set()
+  let outputLine = 1
+  let replacedThrough = 0
+  if (lineCount === 0) outputLine = recordHunkLines(seenLines, before.get(1) ?? [], outputLine)
+
+  for (let line = 1; line <= lineCount; line += 1) {
+    outputLine = recordHunkLines(seenLines, before.get(line) ?? [], outputLine)
+
+    const replacement = replacementByStart.get(line)
+    if (replacement) {
+      outputLine = recordHunkLines(seenLines, [replacement], outputLine)
+      replacedThrough = replacement.end
+    } else if (line > replacedThrough) {
+      if (snapshot.seenLines.has(line)) seenLines.add(outputLine)
+      outputLine += 1
+    }
+
+    outputLine = recordHunkLines(seenLines, afterLines.get(line) ?? [], outputLine)
+  }
+
+  recordHunkLines(seenLines, append, outputLine)
+  return seenLines
+}
+
+function addressedLines(hunks, lineCount) {
+  const lines = new Set()
+  for (const hunk of hunks) {
+    if (hunk.operation === "replace") {
+      for (let line = hunk.start; line <= hunk.end; line += 1) lines.add(line)
+    } else if (hunk.operation === "insert" && hunk.placement !== "append") {
+      lines.add(hunk.line)
+    }
+  }
+  return [...lines].filter((line) => line >= 1 && line <= lineCount).sort((left, right) => left - right)
+}
+
+function revealLines(snapshot, missingLines) {
+  const lines = splitAddressableLines(snapshot.text)
+  let truncated = missingLines.length > SEEN_LINE_REVEAL_CAP
+  const revealed = missingLines.slice(0, SEEN_LINE_REVEAL_CAP).map((line) => {
+    const text = lines[line - 1]
+    if (text.length > SEEN_LINE_REVEAL_MAX_COLUMNS) {
+      truncated = true
+      return {
+        line,
+        text: `${text.slice(0, SEEN_LINE_REVEAL_MAX_COLUMNS - 1)}…`,
+      }
+    }
+    return { line, text }
+  })
+  return { revealed, truncated }
 }
 
 function formatHeader(filePath, tag) {
@@ -81,10 +224,12 @@ export class HashlineService {
     maxPaths = SnapshotStoreLimits.maxPaths,
     maxVersionsPerPath = SnapshotStoreLimits.maxVersionsPerPath,
     maxTotalBytes = SnapshotStoreLimits.maxTotalBytes,
+    enforceSeenLines = true,
   }) {
     if (!worktree) throw new TypeError("worktree is required")
     this.worktree = path.resolve(worktree)
     this.directory = path.resolve(directory)
+    this.enforceSeenLines = enforceSeenLines
     this.filesystem = filesystem ?? new FileSystemAdapter({ root: this.worktree, roots })
     this.readCapabilities = new Map()
     this.store =
@@ -178,6 +323,24 @@ export class HashlineService {
     }
 
     const snapshot = exact[0]
+    const lines = splitAddressableLines(snapshot.text)
+    validateHunks(lines, section.hunks)
+    if (this.enforceSeenLines) {
+      const addressed = addressedLines(section.hunks, lines.length)
+      const missingLines = addressed.filter((line) => !snapshot.seenLines.has(line))
+      if (missingLines.length > 0) {
+        const reveal = revealLines(snapshot, missingLines)
+        if (!reveal.truncated) {
+          for (const { line } of reveal.revealed) snapshot.seenLines.add(line)
+        }
+        throw new SeenLinesError({
+          path: section.path,
+          missingLines,
+          revealed: reveal.revealed,
+          truncated: reveal.truncated,
+        })
+      }
+    }
     const applied = applyReplacements(snapshot.text, section.hunks)
     if (applied.after === snapshot.text) throw new NoChangesError()
 
@@ -185,7 +348,7 @@ export class HashlineService {
       canonicalPath: file.canonicalPath,
       rootId: file.rootId,
       text: applied.after,
-      seenLines: asLineNumbers(1, splitAddressableLines(applied.after)),
+      seenLines: mapSeenLinesAfterEdit(snapshot, section.hunks),
       lineEnding: snapshot.lineEnding,
       bom: snapshot.bom,
     }
@@ -240,5 +403,6 @@ export {
   LineRangeError,
   MissingFileError,
   MismatchError,
+  SeenLinesError,
   SnapshotRequiredError,
 }

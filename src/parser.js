@@ -1,5 +1,8 @@
 const SECTION_HEADER_RE = /^\[(.+)#([0-9a-fA-F]{4})\]$/
 const REPLACE_RE = /^replace\s+([1-9]\d*)(?:-([1-9]\d*))?\s*$/
+const INSERT_BEFORE_RE = /^insert\s+before\s+([1-9]\d*)\s*$/
+const INSERT_AFTER_RE = /^insert\s+after\s+([1-9]\d*)\s*$/
+const APPEND_RE = /^append\s*$/
 
 const V1_REPLACE_ALTERNATIVE = "replace N-M or replace N"
 
@@ -28,6 +31,14 @@ function parseHunkHeader(line, lineNumber) {
     }
     return { operation: "replace", start, end }
   }
+
+  const before = INSERT_BEFORE_RE.exec(line)
+  if (before) return { operation: "insert", placement: "before", line: Number(before[1]) }
+
+  const after = INSERT_AFTER_RE.exec(line)
+  if (after) return { operation: "insert", placement: "after", line: Number(after[1]) }
+
+  if (APPEND_RE.test(line)) return { operation: "insert", placement: "append" }
 
   if (/^PUT(?:\s|$)/.test(line)) unsupportedOperation(line, lineNumber)
   if (/\.=/.test(line)) unsupportedOperation(line, lineNumber, ".=")

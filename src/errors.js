@@ -57,6 +57,22 @@ export class NoChangesError extends HashlineError {
   }
 }
 
+export class SeenLinesError extends HashlineError {
+  constructor({ path, missingLines, revealed, truncated }) {
+    const preview = revealed.map(({ line, text }) => `${line}:${text}`).join("\n")
+    super(
+      `SeenLines guard rejected an edit for ${path}; re-read the missing lines and retry${
+        preview ? `\n${preview}` : ""
+      }`,
+    )
+    this.name = "SeenLinesError"
+    this.path = path
+    this.missingLines = missingLines
+    this.revealed = revealed
+    this.truncated = truncated
+  }
+}
+
 export class MissingFileError extends HashlineError {
   constructor(path) {
     super(`Hashline edits only existing files; use the native write tool to create ${path}`)

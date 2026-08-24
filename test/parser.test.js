@@ -45,6 +45,24 @@ test("parses multiple sections without treating headers as body syntax", () => {
   assert.deepEqual(result.sections[1].hunks[0].body, ["two"])
 })
 
+test("parses insert anchors and append", () => {
+  const result = parsePatch([
+    "[a.ts#AAAA]",
+    "insert before 1",
+    "+head",
+    "insert after 2",
+    "+tail",
+    "append",
+    "+end",
+  ].join("\n"))
+
+  assert.deepEqual(result.sections[0].hunks, [
+    { operation: "insert", placement: "before", line: 1, body: ["head"] },
+    { operation: "insert", placement: "after", line: 2, body: ["tail"] },
+    { operation: "insert", placement: "append", body: ["end"] },
+  ])
+})
+
 test("reports an address-specific v1 alternative for unsupported operations", () => {
   const unsupported = [
     ["PUT 1", "replace N-M or replace N"],

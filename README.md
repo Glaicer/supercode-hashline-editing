@@ -1,7 +1,7 @@
 # hashline-editing
 
-OpenCode server plugin implementing the foundation hashline slice: tagged reads,
-`replace` edits, per-process Snapshots, and a realpath-confined Snapshot Root.
+OpenCode server plugin implementing tagged reads, guarded `replace`/insert edits,
+per-process Snapshots, and a realpath-confined Snapshot Root.
 
 The implementation is self-contained. It does not depend on or vendor
 `@oh-my-pi/hashline`; OpenCode supplies `@opencode-ai/plugin` when the plugin is
@@ -30,3 +30,5 @@ replace 2-3
 +new line three
 ```
 
+Reads accept optional `limit` and `offset` windows. Inserts use `insert before N`,
+`insert after N`, or `append`; all anchors use the original Snapshot line numbers.

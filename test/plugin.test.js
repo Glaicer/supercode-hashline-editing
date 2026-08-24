@@ -57,6 +57,74 @@ test("plugin seam rejects stale edits and edits without a prior read", async () 
   )
 })
 
+test("plugin forwards enforceSeenLines to the service", async () => {
+  const hooks = await HashlinePlugin(
+    { worktree: root, directory: root },
+    { enforceSeenLines: false },
+  )
+  const reading = await hooks.tool.read.execute({ path: "a.ts", limit: 1 }, {})
+
+  await hooks.tool.edit.execute(
+    { patch: `${reading.output.split("\n")[0]}\nreplace 2\n+TWO` },
+    {},
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\nTWO\n")
+})
+
+test("plugin applies insert before, insert after, and append hunks", async () => {
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  const reading = await hooks.tool.read.execute({ path: "a.ts" }, {})
+  const header = reading.output.split("\n")[0]
+
+  await hooks.tool.edit.execute(
+    {
+      patch: [
+        header,
+        "insert before 1",
+        "+zero",
+        "insert after 2",
+        "+between",
+        "append",
+        "+three",
+      ].join("\n"),
+    },
+    {},
+  )
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "zero\none\ntwo\nbetween\nthree\n")
+})
+
+test("plugin exposes an unseen-anchor preview and accepts a complete retry", async () => {
+  await writeFile(path.join(root, "a.ts"), Array.from({ length: 10 }, (_, index) => `line-${index + 1}`).join("\n") + "\n")
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  const reading = await hooks.tool.read.execute({ path: "a.ts", limit: 2 }, {})
+  const patch = `${reading.output.split("\n")[0]}\nreplace 9\n+changed`
+
+  await assert.rejects(hooks.tool.edit.execute({ patch }, {}), (error) => {
+    assert.deepEqual(error.revealed, [{ line: 9, text: "line-9" }])
+    assert.equal(error.truncated, false)
+    return true
+  })
+  await hooks.tool.edit.execute({ patch }, {})
+  assert.equal((await readFile(path.join(root, "a.ts"), "utf8")).split("\n")[8], "changed")
+})
+
+test("plugin keeps rejecting a retry after a truncated preview", async () => {
+  const longLine = "x".repeat(513)
+  await writeFile(path.join(root, "a.ts"), `one\n${longLine}\nthree\n`)
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  const reading = await hooks.tool.read.execute({ path: "a.ts", limit: 1 }, {})
+  const patch = `${reading.output.split("\n")[0]}\nreplace 2\n+changed`
+
+  await assert.rejects(hooks.tool.edit.execute({ patch }, {}), (error) => {
+    assert.equal(error.truncated, true)
+    assert.equal(error.revealed[0].text.length, 512)
+    return true
+  })
+  await assert.rejects(hooks.tool.edit.execute({ patch }, {}), (error) => error.truncated === true)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), `one\n${longLine}\nthree\n`)
+})
+
 test("plugin seam applies the Snapshot Root boundary and rejects foreign rootIds", async () => {
   const hooks = await HashlinePlugin({ worktree: root, directory: root })
   await assert.rejects(
