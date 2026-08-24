@@ -41,6 +41,144 @@ test("registers built-in read/edit names and runs read to edit end-to-end", asyn
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "ONE\ntwo\n")
 })
 
+test("config disables hashline tools while the default keeps them enabled", async () => {
+  const disabled = await HashlinePlugin(
+    { worktree: root, directory: root },
+    { config: { hashline: { enabled: false } } },
+  )
+
+  assert.deepEqual(Object.keys(disabled.tool), [])
+  assert.equal(disabled.tool.read, undefined)
+  assert.equal(disabled.tool.edit, undefined)
+
+  const configuredAfterStartup = await HashlinePlugin({ worktree: root, directory: root })
+  await configuredAfterStartup.config({ hashline: { enabled: false } })
+  assert.deepEqual(Object.keys(configuredAfterStartup.tool), [])
+
+  const defaults = await HashlinePlugin({ worktree: root, directory: root })
+  assert.deepEqual(Object.keys(defaults.tool).sort(), ["edit", "read"])
+})
+
+test("config forwards guard, Snapshot Store limits, and extra Snapshot Roots", async () => {
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  await hooks.config({
+    hashline: {
+      enforceSeenLines: false,
+      maxPaths: 1,
+      maxVersionsPerPath: 1,
+      maxTotalBytes: 8,
+      roots: [outside],
+    },
+  })
+
+  const reading = await hooks.tool.read.execute({ path: "a.ts", limit: 1 }, {})
+  await hooks.tool.edit.execute(
+    { patch: `${reading.output.split("\n")[0]}\nreplace 2\n+TWO` },
+    {},
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\nTWO\n")
+
+  const extraRootReading = await hooks.tool.read.execute(
+    { path: path.join(outside, "secret.ts") },
+    {},
+  )
+  assert.match(extraRootReading.output, /secret/)
+
+  const current = await hooks.tool.read.execute({ path: "a.ts" }, {})
+  await assert.rejects(
+    hooks.tool.edit.execute(
+      { patch: `${current.output.split("\n")[0]}\nreplace 1\n+too-long` },
+      {},
+    ),
+    /Snapshot.*limit/,
+  )
+})
+
+test("config refresh keeps the process Snapshot store and its Tags", async () => {
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  const reading = await hooks.tool.read.execute({ path: "a.ts" }, {})
+
+  await hooks.config({ hashline: { enforceSeenLines: false } })
+  await hooks.tool.edit.execute(
+    { patch: `${reading.output.split("\n")[0]}\nreplace 1\n+ONE` },
+    {},
+  )
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "ONE\ntwo\n")
+})
+
+test("edit description documents the complete hashline patch format", async () => {
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  const description = hooks.tool.edit.description
+
+  for (const fragment of [
+    "[PATH#TAG]",
+    "multiple sections",
+    "one section per file",
+    "replace N-M",
+    "replace N",
+    "insert before N",
+    "insert after N",
+    "append",
+    "+TEXT",
+    "single `+`",
+    "+- item",
+    "++ item",
+    "original Snapshot",
+    "do not shift",
+    "-old",
+    "context lines",
+    "NEVER format/restyle",
+  ]) {
+    assert.match(description, new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), fragment)
+  }
+})
+
+test("plugin reports targeted messages for unsupported patch operations", async () => {
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  const header = (await hooks.tool.read.execute({ path: "a.ts" }, {})).output.split("\n")[0]
+  const cases = [
+    ["replace 5*", /block ops not supported.*replace N-M/],
+    ["CUT", /clipboard not supported/],
+    ["@name", /clipboard not supported/],
+    ["REM", /deletion and movement.*guarded_bash/],
+    ["MV", /deletion and movement.*guarded_bash/],
+    ["PUT", /Oh My Pi syntax not supported.*edit tool/],
+    [".=", /Oh My Pi syntax not supported.*edit tool/],
+  ]
+
+  for (const [operation, message] of cases) {
+    await assert.rejects(
+      hooks.tool.edit.execute({ patch: `${header}\n${operation}\n+body` }, {}),
+      message,
+    )
+  }
+})
+
+test("plugin preserves a read-edit-read-insert chain and rejects the stale tag", async () => {
+  const hooks = await HashlinePlugin({ worktree: root, directory: root })
+  const first = await hooks.tool.read.execute({ path: "a.ts" }, {})
+  const firstHeader = first.output.split("\n")[0]
+
+  const replaced = await hooks.tool.edit.execute(
+    { patch: `${firstHeader}\nreplace 1\n+ONE` },
+    {},
+  )
+  const second = await hooks.tool.read.execute({ path: "a.ts" }, {})
+  assert.equal(second.output.split("\n")[0], replaced.metadata.sections[0].header)
+
+  await hooks.tool.edit.execute(
+    { patch: `${second.output.split("\n")[0]}\ninsert after 2\n+three` },
+    {},
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "ONE\ntwo\nthree\n")
+
+  await assert.rejects(
+    hooks.tool.edit.execute({ patch: `${firstHeader}\nreplace 1\n+stale` }, {}),
+    /MismatchError|re-read/i,
+  )
+})
+
 test("plugin seam rejects stale edits and edits without a prior read", async () => {
   const hooks = await HashlinePlugin({ worktree: root, directory: root })
   const reading = await hooks.tool.read.execute({ path: "a.ts" }, {})
