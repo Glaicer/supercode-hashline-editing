@@ -14,12 +14,26 @@ import {
   NoChangesError,
   SeenLinesError,
   SnapshotRequiredError,
-} from "../src/service.js"
-import { computeTag } from "../src/hash.js"
+} from "./service.ts"
+import { computeTag } from "./hash.ts"
 
-let root
-let outside
-let service
+/** Commit-report fields are attached dynamically; narrow `unknown` rejections to read them. */
+interface RejectedEdit extends Error {
+  path?: string
+  canonicalPath?: string
+  written?: string[]
+  rolledBack?: string[]
+  partiallyWritten?: string[]
+  unwritten?: string[]
+}
+
+function asRejected(error: unknown): RejectedEdit {
+  return error as RejectedEdit
+}
+
+let root: string
+let outside: string
+let service: HashlineService
 
 beforeEach(async () => {
   root = await mkdtemp(path.join(tmpdir(), "hashline-service-"))
@@ -111,10 +125,11 @@ test("unseen anchors reveal a bounded preview and allow a retry when complete", 
   const reading = await service.read("a.ts", 2)
   const patch = `${reading.header}\nreplace 9\n+changed`
 
-  await assert.rejects(service.edit(patch), (error) => {
+  await assert.rejects(service.edit(patch), (error: unknown) => {
     assert.ok(error instanceof SeenLinesError)
-    assert.deepEqual(error.revealed, [{ line: 9, text: "line-9" }])
-    assert.equal(error.truncated, false)
+    const seenLinesError = error as SeenLinesError
+    assert.deepEqual(seenLinesError.revealed, [{ line: 9, text: "line-9" }])
+    assert.equal(seenLinesError.truncated, false)
     return true
   })
 
@@ -129,14 +144,15 @@ test("long or over-cap previews stay truncated and do not authorize a retry", as
   const reading = await service.read("a.ts", 1)
   const patch = `${reading.header}\nreplace 2\n+changed`
 
-  await assert.rejects(service.edit(patch), (error) => {
+  await assert.rejects(service.edit(patch), (error: unknown) => {
     assert.ok(error instanceof SeenLinesError)
-    assert.equal(error.truncated, true)
-    assert.equal(error.revealed[0].text.length, 512)
-    assert.equal(error.revealed[0].text.at(-1), "…")
+    const seenLinesError = error as SeenLinesError
+    assert.equal(seenLinesError.truncated, true)
+    assert.equal(seenLinesError.revealed[0].text.length, 512)
+    assert.equal(seenLinesError.revealed[0].text.at(-1), "…")
     return true
   })
-  await assert.rejects(service.edit(patch), (error) => error instanceof SeenLinesError)
+  await assert.rejects(service.edit(patch), (error: unknown) => error instanceof SeenLinesError)
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), `one\n${longLine}\nthree\n`)
 })
 
@@ -148,15 +164,16 @@ test("reveal previews cap at forty missing lines", async () => {
   const reading = await service.read("a.ts", 1)
   const patch = `${reading.header}\nreplace 2-42\n+changed`
 
-  await assert.rejects(service.edit(patch), (error) => {
+  await assert.rejects(service.edit(patch), (error: unknown) => {
     assert.ok(error instanceof SeenLinesError)
-    assert.equal(error.revealed.length, 40)
-    assert.equal(error.revealed[0].line, 2)
-    assert.equal(error.revealed.at(-1).line, 41)
-    assert.equal(error.truncated, true)
+    const seenLinesError = error as SeenLinesError
+    assert.equal(seenLinesError.revealed.length, 40)
+    assert.equal(seenLinesError.revealed[0].line, 2)
+    assert.equal(seenLinesError.revealed.at(-1)?.line, 41)
+    assert.equal(seenLinesError.truncated, true)
     return true
   })
-  await assert.rejects(service.edit(patch), (error) => error instanceof SeenLinesError)
+  await assert.rejects(service.edit(patch), (error: unknown) => error instanceof SeenLinesError)
 })
 
 test("enforceSeenLines false leaves snapshot freshness checks enabled but skips the visibility guard", async () => {
@@ -174,7 +191,7 @@ test("a new tag keeps the prior snapshot visibility after an edit", async () => 
 
   await assert.rejects(
     service.edit(`${nextHeader}\nreplace 3\n+THREE`),
-    (error) => error instanceof SeenLinesError,
+    (error: unknown) => error instanceof SeenLinesError,
   )
 })
 
@@ -184,7 +201,7 @@ test("stale content fails before writing and asks for a re-read", async () => {
 
   await assert.rejects(
     service.edit(`${reading.header}\nreplace 1\n+ONE`),
-    (error) => error instanceof MismatchError && /re-read/i.test(error.message),
+    (error: unknown) => error instanceof MismatchError && /re-read/i.test(error.message),
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "changed\ntwo\nthree\n")
 })
@@ -206,11 +223,12 @@ test("multi-section preflight rejects a stale later file before writing the firs
         "+ALPHA",
       ].join("\n"),
     ),
-    (error) => {
-      assert.equal(error.path, "b.ts")
-      assert.deepEqual(error.written, [])
-      assert.deepEqual(error.rolledBack, [])
-      assert.deepEqual(error.partiallyWritten, [])
+    (error: unknown) => {
+      const failure = asRejected(error)
+      assert.equal(failure.path, "b.ts")
+      assert.deepEqual(failure.written, [])
+      assert.deepEqual(failure.rolledBack, [])
+      assert.deepEqual(failure.partiallyWritten, [])
       return true
     },
   )
@@ -234,10 +252,11 @@ test("multi-section preflight rejects duplicate canonical paths", async () => {
         "+TWO",
       ].join("\n"),
     ),
-    (error) => {
+    (error: unknown) => {
       assert.ok(error instanceof DuplicatePathError)
-      assert.equal(error.canonicalPath, path.join(root, "a.ts"))
-      assert.deepEqual(error.written, [])
+      const failure = asRejected(error)
+      assert.equal(failure.canonicalPath, path.join(root, "a.ts"))
+      assert.deepEqual(failure.written, [])
       return true
     },
   )
@@ -247,10 +266,11 @@ test("multi-section preflight rejects duplicate canonical paths", async () => {
 test("syntax failures still carry an empty commit report", async () => {
   await assert.rejects(
     service.edit("not a hashline patch"),
-    (error) => {
-      assert.deepEqual(error.written, [])
-      assert.deepEqual(error.rolledBack, [])
-      assert.deepEqual(error.partiallyWritten, [])
+    (error: unknown) => {
+      const failure = asRejected(error)
+      assert.deepEqual(failure.written, [])
+      assert.deepEqual(failure.rolledBack, [])
+      assert.deepEqual(failure.partiallyWritten, [])
       return true
     },
   )
@@ -259,7 +279,7 @@ test("syntax failures still carry an empty commit report", async () => {
 test("edit requires a Snapshot minted by read", async () => {
   await assert.rejects(
     service.edit("[a.ts#AAAA]\nreplace 1\n+ONE"),
-    (error) => error instanceof SnapshotRequiredError && /read/i.test(error.message),
+    (error: unknown) => error instanceof SnapshotRequiredError && /read/i.test(error.message),
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
 })
@@ -267,7 +287,7 @@ test("edit requires a Snapshot minted by read", async () => {
 test("a section without a tag asks for read before edit", async () => {
   await assert.rejects(
     service.edit("[a.ts]\nreplace 1\n+ONE"),
-    (error) => error instanceof SnapshotRequiredError && !(error instanceof MismatchError) && /read first/i.test(error.message),
+    (error: unknown) => error instanceof SnapshotRequiredError && !(error instanceof MismatchError) && /read first/i.test(error.message),
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
 })
@@ -275,7 +295,7 @@ test("a section without a tag asks for read before edit", async () => {
 test("edit refuses missing files and points to the native write tool", async () => {
   await assert.rejects(
     service.edit("[missing.ts#AAAA]\nreplace 1\n+never"),
-    (error) => error instanceof MissingFileError && /native write/i.test(error.message),
+    (error: unknown) => error instanceof MissingFileError && /native write/i.test(error.message),
   )
 })
 
@@ -284,17 +304,17 @@ test("invalid ranges fail before writing with the file line count", async () => 
 
   await assert.rejects(
     service.edit(`${reading.header}\nreplace 999\n+never`),
-    (error) => error instanceof LineRangeError && /Line 999 does not exist \(file has 3 lines\)/.test(error.message),
+    (error: unknown) => error instanceof LineRangeError && /Line 999 does not exist \(file has 3 lines\)/.test(error.message),
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
 })
 
 test("boundary failures do not reveal or write files outside the root", async () => {
-  await assert.rejects(service.read("../secret.ts"), (error) => error instanceof BoundaryError)
-  await assert.rejects(service.read(path.join(outside, "secret.ts")), (error) => error instanceof BoundaryError)
+  await assert.rejects(service.read("../secret.ts"), (error: unknown) => error instanceof BoundaryError)
+  await assert.rejects(service.read(path.join(outside, "secret.ts")), (error: unknown) => error instanceof BoundaryError)
 
   await symlink(path.join(outside, "secret.ts"), path.join(root, "link.ts"))
-  await assert.rejects(service.read("link.ts"), (error) => error instanceof BoundaryError)
+  await assert.rejects(service.read("link.ts"), (error: unknown) => error instanceof BoundaryError)
   assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
 })
 
@@ -308,7 +328,7 @@ test("retargeting a link between read and edit is rejected", async () => {
 
   await assert.rejects(
     service.edit(`${reading.header}\nreplace 1\n+NOPE`),
-    (error) => error instanceof BoundaryError,
+    (error: unknown) => error instanceof BoundaryError,
   )
   assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
 })
@@ -325,16 +345,16 @@ test("retargeting a link to another in-root file cannot rebind the capability", 
 
   await assert.rejects(
     service.edit(`${reading.header}\nreplace 1\n+NOPE`),
-    (error) => error instanceof MismatchError && /different file/i.test(error.message),
+    (error: unknown) => error instanceof MismatchError && /different file/i.test(error.message),
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
   assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "one\ntwo\nthree\n")
 })
 
 test("a 4-hex tag collision is a mismatch instead of a version choice", async () => {
-  const byTag = new Map()
-  let first
-  let second
+  const byTag = new Map<string, string>()
+  let first: string | undefined
+  let second: string | undefined
   for (let index = 0; index < 100_000 && !second; index += 1) {
     const text = `collision-${index}\n`
     const tag = computeTag(text)
@@ -348,12 +368,12 @@ test("a 4-hex tag collision is a mismatch instead of a version choice", async ()
   }
   assert.ok(first && second, "test data must contain a 4-hex collision")
 
-  await writeFile(path.join(root, "a.ts"), first)
+  await writeFile(path.join(root, "a.ts"), first as string)
   const reading = await service.read("a.ts")
   service.store.record({
     canonicalPath: path.join(root, "a.ts"),
     rootId: path.resolve(root),
-    text: second,
+    text: second as string,
     seenLines: [1],
     lineEnding: "lf",
     bom: false,
@@ -361,7 +381,7 @@ test("a 4-hex tag collision is a mismatch instead of a version choice", async ()
 
   await assert.rejects(
     service.edit(`${reading.header}\nreplace 1\n+unsafe`),
-    (error) => error instanceof MismatchError,
+    (error: unknown) => error instanceof MismatchError,
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), first)
 })
@@ -380,7 +400,7 @@ test("a Snapshot from another rootId cannot authorize an edit", async () => {
 
   await assert.rejects(
     service.edit(`${reading.header}\nreplace 1\n+unsafe`),
-    (error) => error instanceof MismatchError,
+    (error: unknown) => error instanceof MismatchError,
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
 })
@@ -401,7 +421,7 @@ test("rejects a patch that leaves normalized text unchanged", async () => {
 
   await assert.rejects(
     service.edit(`${reading.header}\nreplace 1\n+one`),
-    (error) => error instanceof NoChangesError && /resulted in no changes/.test(error.message),
+    (error: unknown) => error instanceof NoChangesError && /resulted in no changes/.test(error.message),
   )
 
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), original)
@@ -444,7 +464,7 @@ test("an evicted tag is a mismatch that requires re-read", async () => {
 
   await assert.rejects(
     constrained.edit(`${first.header}\nreplace 1\n+unsafe`),
-    (error) => error instanceof MismatchError && /re-read/i.test(error.message),
+    (error: unknown) => error instanceof MismatchError && /re-read/i.test(error.message),
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "new\ntwo\nthree\n")
 })

@@ -7,7 +7,7 @@ import {
   restoreLineEndings,
   splitAddressableLines,
   stripBom,
-} from "./hash.js"
+} from "./hash.ts"
 import {
   BoundaryError,
   DuplicateHunkError,
@@ -19,24 +19,109 @@ import {
   NoChangesError,
   SeenLinesError,
   SnapshotRequiredError,
-} from "./errors.js"
+} from "./errors.ts"
+import type { SeenLine } from "./errors.ts"
 import {
   FileNotFoundError,
   FileSystemAdapter,
   PathBoundaryError,
-} from "./filesystem.js"
-import { parsePatch } from "./parser.js"
-import { InMemorySnapshotStore, SnapshotStoreLimits } from "./snapshots.js"
+} from "./filesystem.ts"
+import type { PreparedAtomic, ReadFileResult, ResolvedFile } from "./filesystem.ts"
+import { parsePatch } from "./parser.ts"
+import type { Hunk, ParsedPatch, PatchSection, ReplaceHunk } from "./parser.ts"
+import { InMemorySnapshotStore, SnapshotStoreLimits } from "./snapshots.ts"
+import type { Snapshot, SnapshotInput } from "./snapshots.ts"
 
-function asLineNumbers(start, lines) {
+export interface ReadResult {
+  path: string
+  canonicalPath: string
+  rootId: string
+  header: string
+  numbered: string
+  output: string
+  warnings: string[]
+  tag: string
+  seenLines: number[]
+}
+
+export interface SectionResult {
+  path: string
+  canonicalPath: string
+  op: string
+  before: string
+  after: string
+  persisted: string
+  written: string
+  tag: string
+  fileHash: string
+  header: string
+  firstChangedLine: number | undefined
+  warnings: string[]
+}
+
+export interface EditResult {
+  sections: SectionResult[]
+  written: string[]
+  rolledBack: string[]
+  partiallyWritten: string[]
+}
+
+export interface CommitReport {
+  written: string[]
+  rolledBack: string[]
+  partiallyWritten: string[]
+  unwritten: string[]
+}
+
+export interface RollbackFailure {
+  path: string
+  error: unknown
+}
+
+interface ResolvedSection {
+  section: PatchSection
+  file: ReadFileResult
+}
+
+interface AppliedPatch {
+  after: string
+  firstChangedLine: number | undefined
+}
+
+interface PreparedPlan {
+  section: PatchSection
+  file: ReadFileResult
+  snapshot: Snapshot
+  applied: AppliedPatch
+  nextSnapshotInput: SnapshotInput
+}
+
+interface ForwardCommit {
+  plan: PreparedPlan
+  committed: { persistedText?: string }
+}
+
+export interface HashlineServiceOptions {
+  worktree: string
+  directory?: string
+  roots?: string[]
+  filesystem?: FileSystemAdapter
+  store?: InMemorySnapshotStore
+  maxPaths?: number
+  maxVersionsPerPath?: number
+  maxTotalBytes?: number
+  enforceSeenLines?: boolean
+}
+
+function asLineNumbers(start: number, lines: string[]): Set<number> {
   return new Set(lines.map((_, index) => start + index))
 }
 
-function capabilityKey(inputPath, rootId) {
+function capabilityKey(inputPath: string, rootId: string): string {
   return `${rootId}\u0000${inputPath}`
 }
 
-function mapFilesystemError(error, operation, displayPath) {
+function mapFilesystemError(error: unknown, operation: string, displayPath: string): unknown {
   if (error instanceof PathBoundaryError) return new BoundaryError()
   if (error instanceof FileNotFoundError && operation === "edit") return new MissingFileError(displayPath)
   return error
@@ -45,7 +130,10 @@ function mapFilesystemError(error, operation, displayPath) {
 export const SEEN_LINE_REVEAL_CAP = 40
 export const SEEN_LINE_REVEAL_MAX_COLUMNS = 512
 
-function validateHunks(lines, hunks) {
+function validateHunks(
+  lines: string[],
+  hunks: Hunk[],
+): { lineCount: number; replacements: ReplaceHunk[] } {
   const lineCount = lines.length
 
   for (const hunk of hunks) {
@@ -58,19 +146,21 @@ function validateHunks(lines, hunks) {
     }
 
     if (hunk.operation === "insert" && hunk.placement === "before") {
-      if (hunk.line !== 1 && (hunk.line < 1 || hunk.line > lineCount)) {
-        throw new LineRangeError(hunk.line, lineCount)
+      const line = hunk.line as number
+      if (line !== 1 && (line < 1 || line > lineCount)) {
+        throw new LineRangeError(line, lineCount)
       }
       continue
     }
 
     if (hunk.operation === "insert" && hunk.placement === "after") {
-      if (hunk.line < 1 || hunk.line > lineCount) throw new LineRangeError(hunk.line, lineCount)
+      const line = hunk.line as number
+      if (line < 1 || line > lineCount) throw new LineRangeError(line, lineCount)
     }
   }
 
   const replacements = hunks
-    .filter((hunk) => hunk.operation === "replace")
+    .filter((hunk): hunk is ReplaceHunk => hunk.operation === "replace")
     .sort((left, right) => left.start - right.start || left.end - right.end)
   for (let index = 1; index < replacements.length; index += 1) {
     if (replacements[index].start <= replacements[index - 1].end) throw new DuplicateHunkError()
@@ -79,15 +169,20 @@ function validateHunks(lines, hunks) {
   return { lineCount, replacements }
 }
 
-function appendHunks(target, hunks) {
+function appendHunks(target: string[], hunks: Hunk[]): void {
   for (const hunk of hunks) target.push(...hunk.body)
 }
 
-function indexHunks(hunks, replacements) {
-  const replacementByStart = new Map(replacements.map((hunk) => [hunk.start, hunk]))
-  const before = new Map()
-  const after = new Map()
-  const append = []
+function indexHunks(hunks: Hunk[], replacements: ReplaceHunk[]): {
+  replacementByStart: Map<number, ReplaceHunk>
+  before: Map<number, Hunk[]>
+  after: Map<number, Hunk[]>
+  append: Hunk[]
+} {
+  const replacementByStart = new Map(replacements.map((hunk) => [hunk.start, hunk] as const))
+  const before = new Map<number, Hunk[]>()
+  const after = new Map<number, Hunk[]>()
+  const append: Hunk[] = []
 
   for (const hunk of hunks) {
     if (hunk.operation !== "insert") continue
@@ -96,28 +191,28 @@ function indexHunks(hunks, replacements) {
       continue
     }
     const destination = hunk.placement === "before" ? before : after
-    const existing = destination.get(hunk.line) ?? []
+    const existing = destination.get(hunk.line as number) ?? []
     existing.push(hunk)
-    destination.set(hunk.line, existing)
+    destination.set(hunk.line as number, existing)
   }
 
   return { replacementByStart, before, after, append }
 }
 
-function changedLineForHunk(hunk, lineCount) {
+function changedLineForHunk(hunk: Hunk, lineCount: number): number {
   if (hunk.operation === "replace") return hunk.start
-  if (hunk.placement === "before") return hunk.line
-  if (hunk.placement === "after") return hunk.line + 1
+  if (hunk.placement === "before") return hunk.line as number
+  if (hunk.placement === "after") return (hunk.line as number) + 1
   return lineCount + 1
 }
 
-function applyReplacements(text, hunks) {
+export function applyReplacements(text: string, hunks: Hunk[]): AppliedPatch {
   const lines = splitAddressableLines(text)
   const { lineCount, replacements } = validateHunks(lines, hunks)
   const { replacementByStart, before, after: afterLines, append } = indexHunks(hunks, replacements)
 
   const hadTerminalNewline = text.endsWith("\n")
-  const result = []
+  const result: string[] = []
   let replacedThrough = 0
   if (lineCount === 0) appendHunks(result, before.get(1) ?? [])
   for (let line = 1; line <= lineCount; line += 1) {
@@ -146,7 +241,7 @@ function applyReplacements(text, hunks) {
   }
 }
 
-function recordHunkLines(seenLines, hunks, outputLine) {
+function recordHunkLines(seenLines: Set<number>, hunks: Hunk[], outputLine: number): number {
   for (const hunk of hunks) {
     for (let index = 0; index < hunk.body.length; index += 1) seenLines.add(outputLine + index)
     outputLine += hunk.body.length
@@ -154,11 +249,11 @@ function recordHunkLines(seenLines, hunks, outputLine) {
   return outputLine
 }
 
-function mapSeenLinesAfterEdit(snapshot, hunks) {
+function mapSeenLinesAfterEdit(snapshot: Snapshot, hunks: Hunk[]): Set<number> {
   const lines = splitAddressableLines(snapshot.text)
   const { lineCount, replacements } = validateHunks(lines, hunks)
   const { replacementByStart, before, after: afterLines, append } = indexHunks(hunks, replacements)
-  const seenLines = new Set()
+  const seenLines = new Set<number>()
   let outputLine = 1
   let replacedThrough = 0
   if (lineCount === 0) outputLine = recordHunkLines(seenLines, before.get(1) ?? [], outputLine)
@@ -182,19 +277,22 @@ function mapSeenLinesAfterEdit(snapshot, hunks) {
   return seenLines
 }
 
-function addressedLines(hunks, lineCount) {
-  const lines = new Set()
+function addressedLines(hunks: Hunk[], lineCount: number): number[] {
+  const lines = new Set<number>()
   for (const hunk of hunks) {
     if (hunk.operation === "replace") {
       for (let line = hunk.start; line <= hunk.end; line += 1) lines.add(line)
     } else if (hunk.operation === "insert" && hunk.placement !== "append") {
-      lines.add(hunk.line)
+      lines.add(hunk.line as number)
     }
   }
   return [...lines].filter((line) => line >= 1 && line <= lineCount).sort((left, right) => left - right)
 }
 
-function revealLines(snapshot, missingLines) {
+function revealLines(
+  snapshot: Snapshot,
+  missingLines: number[],
+): { revealed: SeenLine[]; truncated: boolean } {
   const lines = splitAddressableLines(snapshot.text)
   let truncated = missingLines.length > SEEN_LINE_REVEAL_CAP
   const revealed = missingLines.slice(0, SEEN_LINE_REVEAL_CAP).map((line) => {
@@ -211,15 +309,20 @@ function revealLines(snapshot, missingLines) {
   return { revealed, truncated }
 }
 
-function formatHeader(filePath, tag) {
+function formatHeader(filePath: string, tag: string): string {
   return `[${filePath}#${tag}]`
 }
 
-function uniquePaths(paths) {
+function uniquePaths(paths: string[]): string[] {
   return [...new Set(paths)]
 }
 
-function makeCommitReport(paths, written = [], rolledBack = [], partiallyWritten = []) {
+function makeCommitReport(
+  paths: string[],
+  written: string[] = [],
+  rolledBack: string[] = [],
+  partiallyWritten: string[] = [],
+): CommitReport {
   const knownPaths = uniquePaths(paths)
   const forwardWritten = uniquePaths(written)
   const restored = uniquePaths(rolledBack)
@@ -233,19 +336,31 @@ function makeCommitReport(paths, written = [], rolledBack = [], partiallyWritten
   }
 }
 
-function attachCommitReport(error, report, rollbackErrors = []) {
-  Object.assign(error, report, { report, rollbackErrors })
-  const formatPaths = (paths) => (paths.length === 0 ? "none" : paths.join(", "))
-  error.message = `${error.message}; hashline commit report: written=[${formatPaths(
+function attachCommitReport(
+  error: unknown,
+  report: CommitReport,
+  rollbackErrors: RollbackFailure[] = [],
+): unknown {
+  const failure = error as Error & Record<string, unknown>
+  Object.assign(failure, report, { report, rollbackErrors })
+  const formatPaths = (paths: string[]): string => (paths.length === 0 ? "none" : paths.join(", "))
+  failure.message = `${failure.message}; hashline commit report: written=[${formatPaths(
     report.written,
   )}], rolledBack=[${formatPaths(report.rolledBack)}], partiallyWritten=[${formatPaths(
     report.partiallyWritten,
   )}], notWritten=[${formatPaths(report.unwritten)}]`
-  return error
+  return failure
 }
 
 /** Main public read/edit seam for the foundation ticket. */
 export class HashlineService {
+  worktree: string
+  directory: string
+  enforceSeenLines: boolean
+  filesystem: FileSystemAdapter
+  readCapabilities: Map<string, string>
+  store: InMemorySnapshotStore
+
   constructor({
     worktree,
     directory = worktree,
@@ -256,7 +371,7 @@ export class HashlineService {
     maxVersionsPerPath = SnapshotStoreLimits.maxVersionsPerPath,
     maxTotalBytes = SnapshotStoreLimits.maxTotalBytes,
     enforceSeenLines = true,
-  }) {
+  }: HashlineServiceOptions) {
     if (!worktree) throw new TypeError("worktree is required")
     this.worktree = path.resolve(worktree)
     this.directory = path.resolve(directory)
@@ -272,7 +387,7 @@ export class HashlineService {
       })
   }
 
-  async _readFile(inputPath, operation) {
+  async _readFile(inputPath: string, operation: string): Promise<ReadFileResult> {
     try {
       return await this.filesystem.read(inputPath, this.directory)
     } catch (error) {
@@ -280,7 +395,7 @@ export class HashlineService {
     }
   }
 
-  async read(inputPath, limit, offset) {
+  async read(inputPath: string, limit?: number, offset?: number): Promise<ReadResult> {
     const file = await this._readFile(inputPath, "read")
     const lines = splitAddressableLines(file.text)
     const firstLine = offset === undefined ? 1 : Math.max(1, Number(offset))
@@ -311,7 +426,7 @@ export class HashlineService {
     }
   }
 
-  _resolveSnapshot(section, file) {
+  _resolveSnapshot(section: PatchSection, file: ReadFileResult): Snapshot {
     const capability = this.readCapabilities.get(capabilityKey(section.path, file.rootId))
     if (capability && capability !== file.canonicalPath) {
       throw new MismatchError({
@@ -349,7 +464,7 @@ export class HashlineService {
     return exact[0]
   }
 
-  _prepareSection(section, file) {
+  _prepareSection(section: PatchSection, file: ReadFileResult): PreparedPlan {
     const snapshot = this._resolveSnapshot(section, file)
     const lines = splitAddressableLines(snapshot.text)
     validateHunks(lines, section.hunks)
@@ -373,7 +488,7 @@ export class HashlineService {
     const applied = applyReplacements(snapshot.text, section.hunks)
     if (applied.after === snapshot.text) throw new NoChangesError(section.path)
 
-    const nextSnapshotInput = {
+    const nextSnapshotInput: SnapshotInput = {
       canonicalPath: file.canonicalPath,
       rootId: file.rootId,
       text: applied.after,
@@ -385,9 +500,9 @@ export class HashlineService {
     return { section, file, snapshot, applied, nextSnapshotInput }
   }
 
-  async _discardPrepared(prepared) {
+  async _discardPrepared(prepared: PreparedAtomic[]): Promise<unknown[]> {
     if (typeof this.filesystem.discardPrepared !== "function") return []
-    const cleanupErrors = []
+    const cleanupErrors: unknown[] = []
     for (const item of prepared) {
       try {
         await this.filesystem.discardPrepared(item)
@@ -398,9 +513,9 @@ export class HashlineService {
     return cleanupErrors
   }
 
-  async _commitPlans(plans) {
+  async _commitPlans(plans: PreparedPlan[]): Promise<EditResult> {
     const paths = plans.map((plan) => plan.file.canonicalPath)
-    const prepared = []
+    const prepared: PreparedAtomic[] = []
 
     try {
       for (const plan of plans) {
@@ -426,11 +541,11 @@ export class HashlineService {
       }
     } catch (error) {
       const cleanupErrors = await this._discardPrepared(prepared)
-      if (cleanupErrors.length > 0) error.cleanupErrors = cleanupErrors
+      if (cleanupErrors.length > 0) (error as Record<string, unknown>).cleanupErrors = cleanupErrors
       throw attachCommitReport(error, makeCommitReport(paths))
     }
 
-    const forward = []
+    const forward: ForwardCommit[] = []
     try {
       for (let index = 0; index < plans.length; index += 1) {
         const plan = plans[index]
@@ -442,14 +557,16 @@ export class HashlineService {
           forward.push({ plan, committed })
         } catch (error) {
           const mapped = mapFilesystemError(error, "edit", plan.section.path)
-          if (mapped.committed) forward.push({ plan, committed: mapped })
+          if ((mapped as { committed?: unknown }).committed) {
+            forward.push({ plan, committed: mapped as { persistedText?: string } })
+          }
           throw mapped
         }
       }
     } catch (error) {
-      const rolledBack = []
-      const partiallyWritten = []
-      const rollbackErrors = []
+      const rolledBack: string[] = []
+      const partiallyWritten: string[] = []
+      const rollbackErrors: RollbackFailure[] = []
 
       for (const { plan } of forward) {
         try {
@@ -474,7 +591,7 @@ export class HashlineService {
       }
 
       const cleanupErrors = await this._discardPrepared(prepared)
-      if (cleanupErrors.length > 0) error.cleanupErrors = cleanupErrors
+      if (cleanupErrors.length > 0) (error as Record<string, unknown>).cleanupErrors = cleanupErrors
       throw attachCommitReport(
         error,
         makeCommitReport(
@@ -490,11 +607,11 @@ export class HashlineService {
     const cleanupErrors = await this._discardPrepared(prepared)
     if (cleanupErrors.length > 0) {
       const cleanupError = cleanupErrors[0]
-      cleanupError.cleanupErrors = cleanupErrors
+      ;(cleanupError as Record<string, unknown>).cleanupErrors = cleanupErrors
       throw attachCommitReport(cleanupError, makeCommitReport(paths, paths))
     }
     try {
-      const sectionResults = []
+      const sectionResults: SectionResult[] = []
       for (const { plan, committed } of forward) {
         const persisted =
           committed?.persistedText ??
@@ -527,15 +644,15 @@ export class HashlineService {
     }
   }
 
-  async edit(patch) {
-    let parsed
+  async edit(patch: string): Promise<EditResult> {
+    let parsed: ParsedPatch
     try {
       parsed = parsePatch(patch)
     } catch (error) {
       throw attachCommitReport(error, makeCommitReport([]))
     }
     const sections = parsed.sections
-    const resolved = []
+    const resolved: ResolvedSection[] = []
 
     try {
       for (const section of sections) {
@@ -543,7 +660,7 @@ export class HashlineService {
         resolved.push({ section, file })
       }
 
-      const byCanonicalPath = new Map()
+      const byCanonicalPath = new Map<string, ResolvedSection>()
       for (const { section, file } of resolved) {
         const previous = byCanonicalPath.get(file.canonicalPath)
         if (previous) {
@@ -558,7 +675,7 @@ export class HashlineService {
       const plans = resolved.map(({ section, file }) => this._prepareSection(section, file))
       return await this._commitPlans(plans)
     } catch (error) {
-      if (error.report) throw error
+      if ((error as { report?: unknown }).report) throw error
       const reportPaths = uniquePaths([
         ...resolved.map(({ file }) => file.canonicalPath),
         ...sections.slice(resolved.length).map((section) => section.path),
@@ -568,7 +685,6 @@ export class HashlineService {
   }
 }
 
-export { applyReplacements }
 export {
   BoundaryError,
   DuplicatePathError,

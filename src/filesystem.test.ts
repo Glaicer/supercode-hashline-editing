@@ -4,10 +4,10 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os"
 import path from "node:path"
 
-import { FileSystemAdapter, PathBoundaryError } from "../src/filesystem.js"
+import { FileSystemAdapter, PathBoundaryError } from "./filesystem.ts"
 
-let root
-let outside
+let root: string
+let outside: string
 
 beforeEach(async () => {
   root = await mkdtemp(path.join(tmpdir(), "hashline-root-"))
@@ -28,15 +28,15 @@ test("resolves existing files only inside the component boundary", async () => {
   assert.equal(resolved.canonicalPath, path.join(root, "inside.ts"))
   assert.equal(resolved.rootId, path.resolve(root))
 
-  await assert.rejects(filesystem.resolve("../secret.ts"), (error) => error instanceof PathBoundaryError)
-  await assert.rejects(filesystem.resolve(path.join(outside, "secret.ts")), (error) => error instanceof PathBoundaryError)
+  await assert.rejects(filesystem.resolve("../secret.ts"), (error: unknown) => error instanceof PathBoundaryError)
+  await assert.rejects(filesystem.resolve(path.join(outside, "secret.ts")), (error: unknown) => error instanceof PathBoundaryError)
 })
 
 test("rejects a symlink whose real target is outside the Snapshot Root", async () => {
   await symlink(path.join(outside, "secret.ts"), path.join(root, "link.ts"))
   const filesystem = new FileSystemAdapter({ root })
 
-  await assert.rejects(filesystem.resolve("link.ts"), (error) => error instanceof PathBoundaryError)
+  await assert.rejects(filesystem.resolve("link.ts"), (error: unknown) => error instanceof PathBoundaryError)
 })
 
 test("revalidates a symlink before rename", async () => {
@@ -59,7 +59,7 @@ test("revalidates a symlink before rename", async () => {
       lineEnding: "lf",
       bom: false,
     }),
-    (error) => error instanceof PathBoundaryError,
+    (error: unknown) => error instanceof PathBoundaryError,
   )
   assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
 })

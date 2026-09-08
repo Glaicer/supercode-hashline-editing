@@ -1,4 +1,4 @@
-import { SnapshotRequiredError } from "./errors.js"
+import { SnapshotRequiredError } from "./errors.ts"
 
 const SECTION_HEADER_RE = /^\[(.+)#([0-9a-fA-F]{4})\]$/
 const REPLACE_RE = /^replace\s+([1-9]\d*)(?:-([1-9]\d*))?\s*$/
@@ -8,22 +8,58 @@ const APPEND_RE = /^append\s*$/
 
 const V1_REPLACE_ALTERNATIVE = "replace N-M or replace N"
 
+export interface ReplaceHunk {
+  operation: "replace"
+  start: number
+  end: number
+  body: string[]
+}
+
+export interface InsertHunk {
+  operation: "insert"
+  placement: "before" | "after" | "append"
+  line?: number
+  body: string[]
+}
+
+export type Hunk = ReplaceHunk | InsertHunk
+
+export interface PatchSection {
+  path: string
+  tag: string
+  header: string
+  hunks: Hunk[]
+}
+
+export interface ParsedPatch {
+  sections: PatchSection[]
+}
+
 export class PatchSyntaxError extends Error {
-  constructor(message, lineNumber) {
+  lineNumber: number
+  constructor(message: string, lineNumber: number) {
     super(`Patch syntax error on line ${lineNumber}: ${message}`)
     this.name = "PatchSyntaxError"
     this.lineNumber = lineNumber
   }
 }
 
-function unsupportedOperation(line, lineNumber, detail = line, guidance) {
+function unsupportedOperation(
+  line: string,
+  lineNumber: number,
+  detail: string = line,
+  guidance?: string,
+): never {
   throw new PatchSyntaxError(
     `${guidance ?? "unsupported operation/address"}: ${JSON.stringify(detail)} in ${JSON.stringify(line)}; v1 alternative: ${V1_REPLACE_ALTERNATIVE}`,
     lineNumber,
   )
 }
 
-function parseHunkHeader(line, lineNumber) {
+type ReplaceHeader = Omit<ReplaceHunk, "body">
+type InsertHeader = Omit<InsertHunk, "body">
+
+function parseHunkHeader(line: string, lineNumber: number): ReplaceHeader | InsertHeader {
   const match = REPLACE_RE.exec(line)
   if (match) {
     const start = Number(match[1])
@@ -80,7 +116,7 @@ function parseHunkHeader(line, lineNumber) {
   )
 }
 
-function parseSectionHeader(line, lineNumber) {
+function parseSectionHeader(line: string, lineNumber: number): PatchSection {
   const withoutTag = /^\[([^\]]+)\]$/.exec(line)
   if (withoutTag && !withoutTag[1].includes("#")) {
     throw new SnapshotRequiredError(withoutTag[1])
@@ -108,11 +144,11 @@ function parseSectionHeader(line, lineNumber) {
  * A hunk body is self-delimiting: every literal row starts with `+`, and the
  * first row without that prefix belongs to the next patch construct.
  */
-export function parsePatch(input) {
+export function parsePatch(input: unknown): ParsedPatch {
   if (typeof input !== "string") throw new TypeError("patch must be a string")
 
   const lines = input.replace(/\r\n?/g, "\n").split("\n")
-  const sections = []
+  const sections: PatchSection[] = []
   let index = 0
 
   while (index < lines.length) {
@@ -142,7 +178,7 @@ export function parsePatch(input) {
 
       const hunk = parseHunkHeader(hunkLine, hunkLineNumber)
       index += 1
-      const body = []
+      const body: string[] = []
       while (index < lines.length && lines[index].startsWith("+")) {
         body.push(lines[index].slice(1))
         index += 1

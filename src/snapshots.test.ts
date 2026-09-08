@@ -1,10 +1,10 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
-import { computeTag } from "../src/hash.js"
-import { InMemorySnapshotStore } from "../src/snapshots.js"
+import { computeTag } from "./hash.ts"
+import { InMemorySnapshotStore } from "./snapshots.ts"
 
-function snapshot(canonicalPath, rootId, text, seenLines = []) {
+function snapshot(canonicalPath: string, rootId: string, text: string, seenLines: number[] = []) {
   return { canonicalPath, rootId, text, seenLines, lineEnding: "lf", bom: false }
 }
 
@@ -34,9 +34,9 @@ test("normalizes CRLF and LF to one tagged Snapshot", () => {
 
 test("requires an unambiguous exact Snapshot match for a colliding tag", () => {
   const store = new InMemorySnapshotStore()
-  const byTag = new Map()
-  let first
-  let second
+  const byTag = new Map<string, string>()
+  let first: string | undefined
+  let second: string | undefined
 
   for (let index = 0; index < 100_000 && !second; index += 1) {
     const text = `collision-${index}\n`
@@ -51,15 +51,15 @@ test("requires an unambiguous exact Snapshot match for a colliding tag", () => {
   }
 
   assert.ok(first && second, "test data must contain a 4-hex collision")
-  store.record(snapshot("/project/a.ts", "root-a", first, [1]))
-  store.record(snapshot("/project/a.ts", "root-a", second, [1]))
+  store.record(snapshot("/project/a.ts", "root-a", first as string, [1]))
+  store.record(snapshot("/project/a.ts", "root-a", second as string, [1]))
 
-  const exact = store.exactMatches("/project/a.ts", "root-a", computeTag(first), first)
+  const exact = store.exactMatches("/project/a.ts", "root-a", computeTag(first as string), first as string)
   assert.equal(store.versionCount, 2)
   assert.equal(exact.candidates.length, 2)
   assert.equal(exact.exact.length, 1)
-  assert.equal(store.resolve("/project/a.ts", "root-a", computeTag(first), first), null)
-  assert.equal(store.resolve("/project/a.ts", "root-a", computeTag(first), "missing\n"), null)
+  assert.equal(store.resolve("/project/a.ts", "root-a", computeTag(first as string), first as string), null)
+  assert.equal(store.resolve("/project/a.ts", "root-a", computeTag(first as string), "missing\n"), null)
 })
 
 test("bounds versions per path and evicts the least recently used path", () => {

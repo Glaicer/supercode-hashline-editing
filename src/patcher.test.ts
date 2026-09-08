@@ -5,8 +5,8 @@ import {
   normalizeToLF,
   restoreLineEndings,
   stripBom,
-} from "../src/hash.js"
-import { applyReplacements, LineRangeError } from "../src/service.js"
+} from "./hash.ts"
+import { applyReplacements, LineRangeError } from "./service.ts"
 
 test("applies a normalized replacement and restores BOM/CRLF bytes", () => {
   const raw = "\uFEFFone\r\ntwo\r\n"
@@ -39,6 +39,6 @@ test("returns unchanged text for a no-op and rejects invalid ranges", () => {
 
   assert.throws(
     () => applyReplacements(text, [{ operation: "replace", start: 3, end: 3, body: ["three"] }]),
-    (error) => error instanceof LineRangeError && /Line 3 does not exist \(file has 2 lines\)/.test(error.message),
+    (error: unknown) => error instanceof LineRangeError && /Line 3 does not exist \(file has 2 lines\)/.test(error.message),
   )
 })

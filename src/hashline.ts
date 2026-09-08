@@ -1,11 +1,23 @@
 import path from "node:path"
 
-import { HashlineService } from "../src/service.js"
-import { InMemorySnapshotStore, SnapshotStoreLimits } from "../src/snapshots.js"
+import { tool } from "@opencode-ai/plugin"
+import { HashlineService } from "./service.ts"
+import type { EditResult, ReadResult } from "./service.ts"
+import { InMemorySnapshotStore, SnapshotStoreLimits } from "./snapshots.ts"
+import type { FileSystemAdapter } from "./filesystem.ts"
 
-const processStores = new Map()
+const processStores = new Map<string, InMemorySnapshotStore>()
 
-const DEFAULT_CONFIG = Object.freeze({
+interface HashlineDefaults {
+  enabled: boolean
+  enforceSeenLines: boolean
+  roots: string[]
+  maxPaths: number
+  maxVersionsPerPath: number
+  maxTotalBytes: number
+}
+
+const DEFAULT_CONFIG: HashlineDefaults = Object.freeze({
   enabled: true,
   enforceSeenLines: true,
   roots: [],
@@ -25,58 +37,70 @@ const EDIT_DESCRIPTION = [
   "Hashline edits only existing files. NEVER format/restyle code; make only the requested exact changes.",
 ].join(" ")
 
-function fallbackSchemaNode(type) {
-  return {
-    type,
-    describe(description) {
-      this.description = description
-      return this
-    },
-    optional() {
-      this.isOptional = true
-      return this
-    },
-    int() {
-      return this
-    },
-    positive() {
-      return this
-    },
-  }
+export interface HashlineToolResult {
+  title: string
+  output: string
+  metadata: Record<string, unknown>
 }
 
-function fallbackTool(input) {
-  return input
+export interface HashlineToolDefinition {
+  description: string
+  args: unknown
+  // Loose execute signature so tool consumers (and tests) can call with
+  // partial contexts; the definitions themselves are built by `tool()`.
+  execute: (args: any, context?: any) => Promise<any>
 }
 
-fallbackTool.schema = {
-  string: () => fallbackSchemaNode("string"),
-  number: () => fallbackSchemaNode("number"),
+export interface HashlineHooks {
+  tool: Record<string, HashlineToolDefinition>
+  config: (config: unknown) => Promise<void>
 }
 
-async function hostTool() {
-  try {
-    return (await import("@opencode-ai/plugin")).tool
-  } catch (error) {
-    if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error
-    return fallbackTool
-  }
+export interface HashlinePluginInput {
+  worktree?: string
+  directory?: string
+  config?: unknown
 }
 
-function isRecord(value) {
+export interface HashlinePluginOptions {
+  config?: unknown
+  filesystem?: FileSystemAdapter
+  store?: InMemorySnapshotStore
+  toolFactory?: typeof tool
+  enabled?: boolean
+  enforceSeenLines?: boolean
+  roots?: unknown
+  maxPaths?: unknown
+  maxVersionsPerPath?: unknown
+  maxTotalBytes?: unknown
+}
+
+export interface HashlineSettings {
+  enabled: boolean
+  enforceSeenLines: boolean
+  roots: string[]
+  maxPaths: number
+  maxVersionsPerPath: number
+  maxTotalBytes: number
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
 
-function hasOption(options, key) {
-  return Object.prototype.hasOwnProperty.call(options, key) && options[key] !== undefined
+function hasOption(options: HashlinePluginOptions, key: string): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(options, key) &&
+    (options as Record<string, unknown>)[key] !== undefined
+  )
 }
 
-function configSection(config) {
+function configSection(config: unknown): Record<string, unknown> {
   if (!isRecord(config)) return {}
   return isRecord(config.hashline) ? config.hashline : config
 }
 
-function resolveConfiguredRoots(roots, worktree) {
+function resolveConfiguredRoots(roots: unknown, worktree: string): string[] {
   if (roots === undefined) return [...DEFAULT_CONFIG.roots]
   if (!Array.isArray(roots)) throw new TypeError("hashline.roots must be an array")
   return roots.map((root) => {
@@ -87,27 +111,32 @@ function resolveConfiguredRoots(roots, worktree) {
   })
 }
 
-function resolveSettings(config, worktree, options) {
+function resolveSettings(
+  config: unknown,
+  worktree: string,
+  options: HashlinePluginOptions,
+): HashlineSettings {
   const section = configSection(config)
-  const value = (key) => {
-    if (hasOption(options, key)) return options[key]
-    return section[key] === undefined ? DEFAULT_CONFIG[key] : section[key]
+  const defaults = DEFAULT_CONFIG as unknown as Record<string, unknown>
+  const value = (key: string): unknown => {
+    if (hasOption(options, key)) return (options as Record<string, unknown>)[key]
+    return section[key] === undefined ? defaults[key] : section[key]
   }
 
   return {
-    enabled: typeof value("enabled") === "boolean" ? value("enabled") : DEFAULT_CONFIG.enabled,
+    enabled: typeof value("enabled") === "boolean" ? (value("enabled") as boolean) : DEFAULT_CONFIG.enabled,
     enforceSeenLines:
       typeof value("enforceSeenLines") === "boolean"
-        ? value("enforceSeenLines")
+        ? (value("enforceSeenLines") as boolean)
         : DEFAULT_CONFIG.enforceSeenLines,
     roots: resolveConfiguredRoots(value("roots"), worktree),
-    maxPaths: value("maxPaths"),
-    maxVersionsPerPath: value("maxVersionsPerPath"),
-    maxTotalBytes: value("maxTotalBytes"),
+    maxPaths: value("maxPaths") as number,
+    maxVersionsPerPath: value("maxVersionsPerPath") as number,
+    maxTotalBytes: value("maxTotalBytes") as number,
   }
 }
 
-function processStoreFor(worktree, settings) {
+function processStoreFor(worktree: string, settings: HashlineSettings): InMemorySnapshotStore {
   const key = path.resolve(worktree)
   let store = processStores.get(key)
   if (!store) {
@@ -121,7 +150,7 @@ function processStoreFor(worktree, settings) {
   return store
 }
 
-function serializableReadResult(result) {
+function serializableReadResult(result: ReadResult): Record<string, unknown> {
   return {
     path: result.path,
     canonicalPath: result.canonicalPath,
@@ -134,7 +163,7 @@ function serializableReadResult(result) {
   }
 }
 
-function serializableEditResult(result) {
+function serializableEditResult(result: EditResult): Record<string, unknown> {
   return {
     sections: result.sections,
     written: result.written,
@@ -144,15 +173,15 @@ function serializableEditResult(result) {
 }
 
 export async function createHashlineHooks(
-  input,
-  options = {},
-) {
-  const worktree = input.worktree ?? input.directory
+  input: HashlinePluginInput,
+  options: HashlinePluginOptions = {},
+): Promise<HashlineHooks> {
+  const worktree = (input.worktree ?? input.directory) as string
   let settings = resolveSettings(options.config ?? input.config, worktree, options)
-  let service
-  let definitions
+  let service: HashlineService | undefined
+  let definitions: Record<string, HashlineToolDefinition> | undefined
 
-  function getService() {
+  function getService(): HashlineService {
     service ??= new HashlineService({
       worktree,
       directory: input.directory ?? worktree,
@@ -167,9 +196,9 @@ export async function createHashlineHooks(
     return service
   }
 
-  async function getDefinitions() {
+  async function getDefinitions(): Promise<Record<string, HashlineToolDefinition>> {
     if (definitions) return definitions
-    const createTool = options.toolFactory ?? (await hostTool())
+    const createTool = options.toolFactory ?? tool
     definitions = {
       read: createTool({
         description:
@@ -209,9 +238,9 @@ export async function createHashlineHooks(
     return definitions
   }
 
-  const hooks = {
+  const hooks: HashlineHooks = {
     tool: {},
-    async config(config) {
+    async config(config: unknown) {
       settings = resolveSettings(config, worktree, options)
       service = undefined
       const nextTools = settings.enabled ? await getDefinitions() : {}
@@ -224,6 +253,9 @@ export async function createHashlineHooks(
   return hooks
 }
 
-export const HashlinePlugin = async (input, options) => createHashlineHooks(input, options)
+export const HashlinePlugin = async (
+  input: HashlinePluginInput,
+  options: HashlinePluginOptions = {},
+): Promise<HashlineHooks> => createHashlineHooks(input, options)
 
 export default HashlinePlugin

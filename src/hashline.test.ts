@@ -4,14 +4,30 @@ import { mkdtemp, readFile, readdir, rename as renameFile, rm, symlink, writeFil
 import { tmpdir } from "node:os"
 import path from "node:path"
 
-import HashlinePlugin, { createHashlineHooks } from "../plugin/hashline.js"
-import { FileSystemAdapter } from "../src/filesystem.js"
-import { DuplicatePathError } from "../src/service.js"
-import { computeTag } from "../src/hash.js"
-import { InMemorySnapshotStore } from "../src/snapshots.js"
+import HashlinePlugin, { createHashlineHooks } from "./hashline.ts"
+import { FileSystemAdapter } from "./filesystem.ts"
+import { DuplicatePathError } from "./service.ts"
+import { computeTag } from "./hash.ts"
+import { InMemorySnapshotStore } from "./snapshots.ts"
 
-let root
-let outside
+/** Commit-report fields are attached dynamically; narrow `unknown` rejections to read them. */
+interface RejectedEdit extends Error {
+  path?: string
+  canonicalPath?: string
+  written?: string[]
+  rolledBack?: string[]
+  partiallyWritten?: string[]
+  unwritten?: string[]
+  revealed?: Array<{ line: number; text: string }>
+  truncated?: boolean
+}
+
+function asRejected(error: unknown): RejectedEdit {
+  return error as RejectedEdit
+}
+
+let root: string
+let outside: string
 
 beforeEach(async () => {
   root = await mkdtemp(path.join(tmpdir(), "hashline-plugin-"))
@@ -137,7 +153,7 @@ test("edit description documents the complete hashline patch format", async () =
 test("plugin reports targeted messages for unsupported patch operations", async () => {
   const hooks = await HashlinePlugin({ worktree: root, directory: root })
   const header = (await hooks.tool.read.execute({ path: "a.ts" }, {})).output.split("\n")[0]
-  const cases = [
+  const cases: Array<[string, RegExp]> = [
     ["replace 5*", /block ops not supported.*replace N-M/],
     ["CUT", /clipboard not supported/],
     ["@name", /clipboard not supported/],
@@ -280,13 +296,14 @@ test("plugin preflights every section before writing any file", async () => {
       },
       {},
     ),
-    (error) => {
-      assert.equal(error.path, "b.ts")
-      assert.deepEqual(error.written, [])
-      assert.deepEqual(error.rolledBack, [])
-      assert.deepEqual(error.partiallyWritten, [])
-      assert.match(error.message, /b\.ts/)
-      return /re-read/i.test(error.message)
+    (error: unknown) => {
+      const failure = asRejected(error)
+      assert.equal(failure.path, "b.ts")
+      assert.deepEqual(failure.written, [])
+      assert.deepEqual(failure.rolledBack, [])
+      assert.deepEqual(failure.partiallyWritten, [])
+      assert.match(failure.message, /b\.ts/)
+      return /re-read/i.test(failure.message)
     },
   )
 
@@ -316,12 +333,13 @@ test("plugin rolls back earlier sections when a later rename fails", async () =>
       },
       {},
     ),
-    (error) => {
-      assert.deepEqual(error.written, [path.join(root, "a.ts")])
-      assert.deepEqual(error.rolledBack, [path.join(root, "a.ts")])
-      assert.deepEqual(error.partiallyWritten, [])
-      assert.match(error.message, /a\.ts|b\.ts/)
-      return /injected rename 2 failure/.test(error.message)
+    (error: unknown) => {
+      const failure = asRejected(error)
+      assert.deepEqual(failure.written, [path.join(root, "a.ts")])
+      assert.deepEqual(failure.rolledBack, [path.join(root, "a.ts")])
+      assert.deepEqual(failure.partiallyWritten, [])
+      assert.match(failure.message, /a\.ts|b\.ts/)
+      return /injected rename 2 failure/.test(failure.message)
     },
   )
 
@@ -352,14 +370,15 @@ test("plugin reports a partial write when rollback fails", async () => {
       },
       {},
     ),
-    (error) => {
-      assert.deepEqual(error.written, [path.join(root, "a.ts")])
-      assert.deepEqual(error.rolledBack, [])
-      assert.deepEqual(error.partiallyWritten, [path.join(root, "a.ts")])
-      assert.deepEqual(error.unwritten, [path.join(root, "b.ts")])
-      assert.match(error.message, /a\.ts/)
-      assert.match(error.message, /b\.ts/)
-      return /injected rename 2 failure/.test(error.message)
+    (error: unknown) => {
+      const failure = asRejected(error)
+      assert.deepEqual(failure.written, [path.join(root, "a.ts")])
+      assert.deepEqual(failure.rolledBack, [])
+      assert.deepEqual(failure.partiallyWritten, [path.join(root, "a.ts")])
+      assert.deepEqual(failure.unwritten, [path.join(root, "b.ts")])
+      assert.match(failure.message, /a\.ts/)
+      assert.match(failure.message, /b\.ts/)
+      return /injected rename 2 failure/.test(failure.message)
     },
   )
 
@@ -381,11 +400,12 @@ test("plugin rejects sections that resolve to one canonical path", async () => {
       },
       {},
     ),
-    (error) => {
+    (error: unknown) => {
       assert.ok(error instanceof DuplicatePathError)
-      assert.equal(error.canonicalPath, path.join(root, "a.ts"))
-      assert.deepEqual(error.written, [])
-      return /a\.ts|alias\.ts/.test(error.message)
+      const failure = asRejected(error)
+      assert.equal(failure.canonicalPath, path.join(root, "a.ts"))
+      assert.deepEqual(failure.written, [])
+      return /a\.ts|alias\.ts/.test(failure.message)
     },
   )
 
@@ -399,9 +419,11 @@ test("plugin exposes an unseen-anchor preview and accepts a complete retry", asy
   const reading = await hooks.tool.read.execute({ path: "a.ts", limit: 2 }, {})
   const patch = `${reading.output.split("\n")[0]}\nreplace 9\n+changed`
 
-  await assert.rejects(hooks.tool.edit.execute({ patch }, {}), (error) => {
-    assert.deepEqual(error.revealed, [{ line: 9, text: "line-9" }])
-    assert.equal(error.truncated, false)
+  await assert.rejects(hooks.tool.edit.execute({ patch }, {}), (error: unknown) => {
+    assert.ok(error instanceof Error)
+    const failure = asRejected(error)
+    assert.deepEqual(failure.revealed, [{ line: 9, text: "line-9" }])
+    assert.equal(failure.truncated, false)
     return true
   })
   await hooks.tool.edit.execute({ patch }, {})
@@ -415,12 +437,14 @@ test("plugin keeps rejecting a retry after a truncated preview", async () => {
   const reading = await hooks.tool.read.execute({ path: "a.ts", limit: 1 }, {})
   const patch = `${reading.output.split("\n")[0]}\nreplace 2\n+changed`
 
-  await assert.rejects(hooks.tool.edit.execute({ patch }, {}), (error) => {
-    assert.equal(error.truncated, true)
-    assert.equal(error.revealed[0].text.length, 512)
+  await assert.rejects(hooks.tool.edit.execute({ patch }, {}), (error: unknown) => {
+    assert.ok(error instanceof Error)
+    const failure = asRejected(error)
+    assert.equal(failure.truncated, true)
+    assert.equal(failure.revealed?.[0]?.text.length, 512)
     return true
   })
-  await assert.rejects(hooks.tool.edit.execute({ patch }, {}), (error) => error.truncated === true)
+  await assert.rejects(hooks.tool.edit.execute({ patch }, {}), (error: unknown) => (error as RejectedEdit).truncated === true)
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), `one\n${longLine}\nthree\n`)
 })
 

@@ -15,11 +15,11 @@ const XX64_P5 = 0x27d4eb2f165667c5n
 
 const textEncoder = new TextEncoder()
 
-function bytesOf(text) {
+function bytesOf(text: string): Uint8Array {
   return textEncoder.encode(text)
 }
 
-function readUint32(bytes, offset) {
+function readUint32(bytes: Uint8Array, offset: number): number {
   return (
     bytes[offset] |
     (bytes[offset + 1] << 8) |
@@ -28,7 +28,7 @@ function readUint32(bytes, offset) {
   ) >>> 0
 }
 
-function readUint64(bytes, offset) {
+function readUint64(bytes: Uint8Array, offset: number): bigint {
   let value = 0n
   for (let index = 0; index < 8; index += 1) {
     value |= BigInt(bytes[offset + index]) << BigInt(index * 8)
@@ -36,27 +36,27 @@ function readUint64(bytes, offset) {
   return value
 }
 
-function rotateLeft32(value, bits) {
+function rotateLeft32(value: number, bits: number): number {
   return ((value << bits) | (value >>> (32 - bits))) >>> 0
 }
 
-function xxHash32Round(accumulator, input) {
+function xxHash32Round(accumulator: number, input: number): number {
   let value = (accumulator + Math.imul(input, XX32_P2)) >>> 0
   value = rotateLeft32(value, 13)
   return Math.imul(value, XX32_P1) >>> 0
 }
 
-function xxHash32MergeRound(accumulator, value) {
+function xxHash32MergeRound(accumulator: number, value: number): number {
   let result = (accumulator ^ xxHash32Round(0, value)) >>> 0
   result = (Math.imul(result, XX32_P1) + XX32_P4) >>> 0
   return result
 }
 
 /** Return the unsigned xxHash32 value for a UTF-8 string. */
-export function xxHash32(text, seed = 0) {
+export function xxHash32(text: string, seed = 0): number {
   const bytes = bytesOf(text)
   let offset = 0
-  let hash
+  let hash: number
 
   if (bytes.length >= 16) {
     let v1 = (seed + XX32_P1 + XX32_P2) >>> 0
@@ -108,27 +108,27 @@ export function xxHash32(text, seed = 0) {
   return hash >>> 0
 }
 
-function rotateLeft64(value, bits) {
+function rotateLeft64(value: bigint, bits: number): bigint {
   return ((value << BigInt(bits)) | (value >> BigInt(64 - bits))) & UINT64_MASK
 }
 
-function xxHash64Round(accumulator, input) {
+function xxHash64Round(accumulator: bigint, input: bigint): bigint {
   let value = (accumulator + input * XX64_P2) & UINT64_MASK
   value = rotateLeft64(value, 31)
   return (value * XX64_P1) & UINT64_MASK
 }
 
-function xxHash64MergeRound(accumulator, value) {
+function xxHash64MergeRound(accumulator: bigint, value: bigint): bigint {
   let result = (accumulator ^ xxHash64Round(0n, value)) & UINT64_MASK
   result = (result * XX64_P1 + XX64_P4) & UINT64_MASK
   return result
 }
 
 /** Return the uppercase hexadecimal xxHash64 value for a UTF-8 string. */
-export function xxHash64(text, seed = 0n) {
+export function xxHash64(text: string, seed = 0n): string {
   const bytes = bytesOf(text)
   let offset = 0
-  let hash
+  let hash: bigint
 
   if (bytes.length >= 32) {
     let v1 = (seed + XX64_P1 + XX64_P2) & UINT64_MASK
@@ -186,19 +186,19 @@ export function xxHash64(text, seed = 0n) {
   return hash.toString(16).padStart(16, "0").toUpperCase()
 }
 
-export function stripBom(text) {
+export function stripBom(text: string): string {
   return text.startsWith("\uFEFF") ? text.slice(1) : text
 }
 
-export function hasBom(text) {
+export function hasBom(text: string): boolean {
   return text.startsWith("\uFEFF")
 }
 
-export function normalizeToLF(text) {
+export function normalizeToLF(text: string): string {
   return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
 }
 
-export function detectLineEnding(text) {
+export function detectLineEnding(text: string): string {
   let crlfCount = 0
   let lfCount = 0
 
@@ -218,35 +218,35 @@ export function detectLineEnding(text) {
   return crlfCount > lfCount ? "crlf" : "lf"
 }
 
-export function restoreLineEndings(text, lineEnding, bom = false) {
+export function restoreLineEndings(text: string, lineEnding: string, bom = false): string {
   const restored = lineEnding === "crlf" ? text.replace(/\n/g, "\r\n") : text
   return bom ? `\uFEFF${restored}` : restored
 }
 
-export function normalizeFileHashText(text) {
+export function normalizeFileHashText(text: string): string {
   return text.replace(/[ \t\r]+(?=\n|$)/g, "")
 }
 
-export function computeTag(text) {
+export function computeTag(text: string): string {
   const normalized = normalizeToLF(stripBom(text))
   return (xxHash32(normalizeFileHashText(normalized)) & 0xffff).toString(16).padStart(4, "0").toUpperCase()
 }
 
-export function computeDigest(text) {
+export function computeDigest(text: string): string {
   return xxHash64(normalizeToLF(stripBom(text)))
 }
 
-export function splitAddressableLines(text) {
+export function splitAddressableLines(text: string): string[] {
   if (text === "") return []
   const lines = text.split("\n")
   if (lines.at(-1) === "") lines.pop()
   return lines
 }
 
-export function formatNumberedLines(lines, startLine = 1) {
+export function formatNumberedLines(lines: string[], startLine = 1): string {
   return lines.map((line, index) => `${startLine + index}:${line}`).join("\n")
 }
 
-export function utf8ByteLength(text) {
+export function utf8ByteLength(text: string): number {
   return bytesOf(text).byteLength
 }

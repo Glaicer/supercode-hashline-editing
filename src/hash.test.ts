@@ -11,7 +11,7 @@ import {
   stripBom,
   xxHash32,
   xxHash64,
-} from "../src/hash.js"
+} from "./hash.ts"
 
 test("xxHash vectors are stable", () => {
   assert.equal(xxHash32(""), 0x02cc5d05)

@@ -1,8 +1,8 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
-import { SnapshotRequiredError } from "../src/errors.js"
-import { parsePatch, PatchSyntaxError } from "../src/parser.js"
+import { SnapshotRequiredError } from "./errors.ts"
+import { parsePatch, PatchSyntaxError } from "./parser.ts"
 
 test("parses replace ranges and strips exactly one body prefix", () => {
   const patch = [
@@ -79,10 +79,11 @@ test("reports an address-specific v1 alternative for unsupported operations", ()
   for (const [operation, alternative] of unsupported) {
     assert.throws(
       () => parsePatch(`[a.ts#AAAA]\n${operation}`),
-      (error) => {
+      (error: unknown) => {
         assert.ok(error instanceof PatchSyntaxError)
-        assert.match(error.message, new RegExp(operation.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
-        assert.match(error.message, new RegExp(alternative.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+        const syntaxError = error as PatchSyntaxError
+        assert.match(syntaxError.message, new RegExp(operation.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+        assert.match(syntaxError.message, new RegExp(alternative.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
         return true
       },
     )
@@ -92,6 +93,6 @@ test("reports an address-specific v1 alternative for unsupported operations", ()
 test("reports a missing tag for a later section instead of parsing it as a hunk", () => {
   assert.throws(
     () => parsePatch("[a.ts#AAAA]\nreplace 1\n+one\n[b.ts]\nreplace 1\n+two"),
-    (error) => error instanceof SnapshotRequiredError && /b\.ts/.test(error.message) && /read/i.test(error.message),
+    (error: unknown) => error instanceof SnapshotRequiredError && /b\.ts/.test(error.message) && /read/i.test(error.message),
   )
 })
