@@ -6,13 +6,14 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
-const target = manifest.exports?.["."];
 
-assert.equal(target, "./dist/hashline.js", "root export must be compiled JavaScript");
-assert.equal(manifest.exports?.["./server"], "./dist/hashline.js", "server export must resolve to the hashline entry");
+assert.equal(manifest.exports?.["."], "./dist/index.js", "root export must be the V2 entry");
+assert.equal(manifest.main, "./dist/index.js", "main must be the V2 entry");
+assert.equal(manifest.engines?.opencode, ">=2.0.0", "package must declare V2 hosts only");
 
 const compiled = [
-  "./dist/hashline.js",
+  "./dist/index.js",
+  "./dist/plugin.js",
   "./dist/service.js",
   "./dist/parser.js",
   "./dist/snapshots.js",
@@ -26,8 +27,10 @@ for (const entry of compiled) {
   assert.doesNotMatch(code, /from ["'][^"']+\.ts["']/, `compiled ${entry} must not import TypeScript`);
 }
 
-const entryCode = readFileSync(resolve(root, "./dist/hashline.js"), "utf8");
-assert.match(entryCode, /export default /, "compiled entry must keep a default export for loaders that require one");
+const entryCode = readFileSync(resolve(root, "./dist/index.js"), "utf8");
+assert.match(entryCode, /Plugin\.define/, "compiled entry must define the plugin through the V2 package");
+const rootEntry = readFileSync(resolve(root, "./index.js"), "utf8");
+assert.match(rootEntry, /export \{ default \} from "\.\/dist\/index\.js"/, "root entry must re-export the compiled entry");
 
 const packed = JSON.parse(
   execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
@@ -41,6 +44,7 @@ const files = pack.files.map((file) => file.path);
 for (const entry of compiled) {
   assert.ok(files.includes(entry.replace(/^\.\//, "")), `tarball must include ${entry}`);
 }
+assert.ok(files.includes("index.js"), "tarball must include the host-resolvable root entry");
 assert.ok(!files.some((file) => file.endsWith(".ts")), "tarball must not include raw sources");
 
-console.log("package artifact: compiled JS only");
+console.log("package artifact: compiled V2 plugin JS only");

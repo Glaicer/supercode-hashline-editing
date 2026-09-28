@@ -88,9 +88,9 @@ export interface FileSystemAdapterOptions {
   rename?: typeof rename
 }
 
-function isInside(root: string, candidate: string): boolean {
+export function isInside(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate)
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
 }
 
 function decodeBytes(bytes: Buffer): DecodedFile {

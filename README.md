@@ -2,6 +2,8 @@
 
 An OpenCode plugin that edits files by line number instead of search and replace. Search and replace breaks when the same code shows up twice. Plain line numbers break when an earlier edit moves the lines below it.
 
+The installation instructions below describe the released V1 package (`0.1.0`). This checkout contains an in-progress OpenCode V2 port; do not use the V1 commands below to install this development build. V2 packaging and migration instructions are tracked in ticket 05.
+
 ## What it does
 
 Each `read` returns a `[PATH#TAG]` header. The tag names the exact version you read, so `edit` can check it before it writes.

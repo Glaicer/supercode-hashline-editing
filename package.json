@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@glaicer/supercode-hashline-editing",
   "version": "0.1.0",
-  "description": "OpenCode plugin for capability-bound hashline read/edit operations",
+  "description": "OpenCode V2 plugin for capability-bound hashline read/edit operations",
   "type": "module",
   "license": "MIT",
   "author": "Dmitrii Aronov <aronov.mml@gmail.com>",
@@ -19,10 +19,10 @@
     "opencode-plugin",
     "hashline-editing"
   ],
-  "main": "./dist/hashline.js",
+  "main": "./dist/index.js",
   "exports": {
-    ".": "./dist/hashline.js",
-    "./server": "./dist/hashline.js",
+    ".": "./dist/index.js",
+    "./plugin": "./dist/plugin.js",
     "./service": "./dist/service.js",
     "./parser": "./dist/parser.js",
     "./snapshots": "./dist/snapshots.js",
@@ -31,7 +31,8 @@
     "./errors": "./dist/errors.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "index.js"
   ],
   "publishConfig": {
     "access": "public"
@@ -44,7 +45,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode-ai/plugin": ">=1.18.21"
+    "@opencode/plugin": "2.0.18"
   },
   "devDependencies": {
     "@babel/core": "7.28.0",
@@ -54,6 +55,6 @@
   },
   "engines": {
     "node": ">=24",
-    "opencode": ">=1.18.21"
+    "opencode": ">=2.0.0"
   }
 }

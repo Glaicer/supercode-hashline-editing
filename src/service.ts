@@ -113,8 +113,8 @@ export interface HashlineServiceOptions {
   enforceSeenLines?: boolean
 }
 
-function asLineNumbers(start: number, lines: string[]): Set<number> {
-  return new Set(lines.map((_, index) => start + index))
+function asLineNumbers(start: number, lines: string[], seenLine: (line: string) => boolean): Set<number> {
+  return new Set(lines.flatMap((line, index) => seenLine(line) ? [start + index] : []))
 }
 
 function capabilityKey(inputPath: string, rootId: string): string {
@@ -395,7 +395,7 @@ export class HashlineService {
     }
   }
 
-  async read(inputPath: string, limit?: number, offset?: number): Promise<ReadResult> {
+  async read(inputPath: string, limit?: number, offset?: number, seenLine: (line: string) => boolean = () => true): Promise<ReadResult> {
     const file = await this._readFile(inputPath, "read")
     const lines = splitAddressableLines(file.text)
     const firstLine = offset === undefined ? 1 : Math.max(1, Number(offset))
@@ -405,7 +405,7 @@ export class HashlineService {
       canonicalPath: file.canonicalPath,
       rootId: file.rootId,
       text: file.text,
-      seenLines: asLineNumbers(firstLine, visibleLines),
+      seenLines: asLineNumbers(firstLine, visibleLines, seenLine),
       lineEnding: file.lineEnding,
       bom: file.bom,
     })
