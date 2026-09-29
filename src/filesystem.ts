@@ -33,9 +33,11 @@ export class NotAFileError extends Error {
 }
 
 export class LiveFileChangedError extends Error {
-  constructor() {
+  actualText: string
+  constructor(actualText: string) {
     super("Live file changed before commit; re-read and retry")
     this.name = "LiveFileChangedError"
+    this.actualText = actualText
   }
 }
 
@@ -212,7 +214,7 @@ export class FileSystemAdapter {
     if (initial.canonicalPath !== canonicalPath || initial.rootId !== rootId) throw new PathBoundaryError()
 
     const liveBefore = await this._readNormalized(initial)
-    if (liveBefore.text !== expectedText) throw new LiveFileChangedError()
+    if (liveBefore.text !== expectedText) throw new LiveFileChangedError(liveBefore.text)
 
     const directory = path.dirname(initial.canonicalPath)
     const temporaryPath = path.join(
@@ -284,7 +286,7 @@ export class FileSystemAdapter {
         throw new PathBoundaryError()
       }
       const liveBeforeRename = await this._readNormalized(current)
-      if (liveBeforeRename.text !== prepared.expectedText) throw new LiveFileChangedError()
+      if (liveBeforeRename.text !== prepared.expectedText) throw new LiveFileChangedError(liveBeforeRename.text)
 
       await this.renameFile(prepared.temporaryPath, prepared.canonicalPath)
       result = {

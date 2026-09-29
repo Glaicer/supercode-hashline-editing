@@ -1,12 +1,14 @@
 import { test, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 
 import { resolveHashlineSettings, setupHashlinePlugin } from "./plugin.ts"
 import { computeTag } from "./hash.ts"
-import { BoundaryError, MismatchError, SeenLinesError, SnapshotRequiredError } from "./errors.ts"
+import { BoundaryError, DuplicatePathError, MismatchError, NoChangesError, SeenLinesError, SnapshotRequiredError } from "./errors.ts"
+import { FileSystemAdapter } from "./filesystem.ts"
+import { PatchSyntaxError } from "./parser.ts"
 
 type AnyRecord = Record<string, any>
 
@@ -102,6 +104,7 @@ interface HarnessInput {
   directory: string
   options?: unknown
   nativeRead?: NativeReadBehavior
+  filesystem?: FileSystemAdapter
 }
 
 interface Harness {
@@ -112,7 +115,7 @@ interface Harness {
   replay: (withNative?: boolean) => Map<string, AnyRecord>
 }
 
-async function createHarness({ directory, options, nativeRead }: HarnessInput): Promise<Harness> {
+async function createHarness({ directory, options, nativeRead, filesystem }: HarnessInput): Promise<Harness> {
   const editor = createFakeEditor()
   const nativeCalls: Array<{ input: AnyRecord; context: ToolContextLike }> = []
   const addNativeRead = (target: ReturnType<typeof createFakeEditor>) => {
@@ -144,7 +147,7 @@ async function createHarness({ directory, options, nativeRead }: HarnessInput): 
     },
   } as unknown as Parameters<typeof setupHashlinePlugin>[0]
 
-  const cleanup = await setupHashlinePlugin(ctx)
+  const cleanup = await setupHashlinePlugin(ctx, filesystem)
   return {
     tools: editor.tools,
     nativeCalls,
@@ -351,6 +354,131 @@ test("read to edit replace chain updates the file and reports header plus firstC
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "ONE\nTWO\n")
 })
 
+test("one patch applies every hunk against original line numbers across multiple files", async () => {
+  await writeFile(path.join(root, "b.ts"), "alpha\nbeta\n")
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), await readFile(path.join(root, String(input.path)), "utf8")) },
+  })
+  const read = readTool(harness.tools)
+  const edit = editTool(harness.tools)
+  const a = await read.execute({ path: "a.ts" }, CONTEXT)
+  const b = await read.execute({ path: "b.ts" }, CONTEXT)
+  const result = await edit.execute({ patch: [
+    a.metadata.header,
+    "insert before 1", "+head",
+    "replace 1-2", "+- item", "++ item", "+",
+    "insert after 2", "+tail",
+    "append", "+end",
+    b.metadata.header,
+    "replace 2", "+BETA", "+more",
+  ].join("\n") }, CONTEXT)
+
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "head\n- item\n+ item\n\ntail\nend\n")
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "alpha\nBETA\nmore\n")
+  assert.deepEqual(result.metadata.written, [path.join(root, "a.ts"), path.join(root, "b.ts")])
+  assert.deepEqual(result.metadata.rolledBack, [])
+  assert.deepEqual(result.metadata.partiallyWritten, [])
+  assert.deepEqual(result.metadata.sections.map((section: AnyRecord) => section.firstChangedLine), [1, 2])
+})
+
+test("a failed second rename restores the first file from its pre-image", async () => {
+  await writeFile(path.join(root, "b.ts"), "alpha\n")
+  const filesystem = new FileSystemAdapter({
+    root,
+    rename: async (source, target) => {
+      if (target === path.join(root, "b.ts")) throw new Error("injected rename failure")
+      return rename(source, target)
+    },
+  })
+  const harness = await createHarness({
+    directory: root,
+    filesystem,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), await readFile(path.join(root, String(input.path)), "utf8")) },
+  })
+  const a = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
+  const b = await readTool(harness.tools).execute({ path: "b.ts" }, CONTEXT)
+
+  await assert.rejects(
+    editTool(harness.tools).execute({ patch: `${a.metadata.header}\nreplace 1\n+ONE\n${b.metadata.header}\nreplace 1\n+ALPHA` }, CONTEXT),
+    (error: unknown) => {
+      const failure = error as AnyRecord
+      assert.match(failure.message, /injected rename failure/)
+      assert.deepEqual(failure.written, [path.join(root, "a.ts")])
+      assert.deepEqual(failure.rolledBack, [path.join(root, "a.ts")])
+      assert.deepEqual(failure.partiallyWritten, [])
+      return true
+    },
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "alpha\n")
+  assert.deepEqual((await readdir(root)).sort(), ["a.ts", "b.ts"])
+})
+
+test("a failed rollback reports the first file as partially written", async () => {
+  await writeFile(path.join(root, "b.ts"), "alpha\n")
+  let firstRenamed = false
+  const harness = await createHarness({
+    directory: root,
+    filesystem: new FileSystemAdapter({
+      root,
+      rename: async (source, target) => {
+        if (target === path.join(root, "b.ts") || (target === path.join(root, "a.ts") && firstRenamed)) {
+          throw new Error("injected rename failure")
+        }
+        firstRenamed = true
+        return rename(source, target)
+      },
+    }),
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), await readFile(path.join(root, String(input.path)), "utf8")) },
+  })
+  const a = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
+  const b = await readTool(harness.tools).execute({ path: "b.ts" }, CONTEXT)
+
+  await assert.rejects(
+    editTool(harness.tools).execute({ patch: `${a.metadata.header}\nreplace 1\n+ONE\n${b.metadata.header}\nreplace 1\n+ALPHA` }, CONTEXT),
+    (error: unknown) => {
+      const failure = error as AnyRecord
+      assert.deepEqual(failure.written, [path.join(root, "a.ts")])
+      assert.deepEqual(failure.rolledBack, [])
+      assert.deepEqual(failure.partiallyWritten, [path.join(root, "a.ts")])
+      assert.match(failure.message, /partiallyWritten=\[.*a\.ts\]/)
+      return true
+    },
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "ONE\ntwo\n")
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "alpha\n")
+  assert.deepEqual((await readdir(root)).sort(), ["a.ts", "b.ts"])
+})
+
+test("drift immediately before the second rename reports its Tag and rolls back the first file", async () => {
+  await writeFile(path.join(root, "b.ts"), "alpha\n")
+  const changed = "external\n"
+  const harness = await createHarness({
+    directory: root,
+    filesystem: new class extends FileSystemAdapter {
+      override async commitPrepared(prepared: Parameters<FileSystemAdapter["commitPrepared"]>[0]) {
+        if (prepared.inputPath === "b.ts") await writeFile(path.join(root, "b.ts"), changed)
+        return super.commitPrepared(prepared)
+      }
+    }({ root }),
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), await readFile(path.join(root, String(input.path)), "utf8")) },
+  })
+  const a = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
+  const b = await readTool(harness.tools).execute({ path: "b.ts" }, CONTEXT)
+  await assert.rejects(editTool(harness.tools).execute({ patch: `${a.metadata.header}\nreplace 1\n+ONE\n${b.metadata.header}\nreplace 1\n+ALPHA` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof MismatchError)
+    assert.equal(error.actualTag, computeTag(changed))
+    assert.deepEqual((error as AnyRecord).written, [path.join(root, "a.ts")])
+    assert.deepEqual((error as AnyRecord).rolledBack, [path.join(root, "a.ts")])
+    assert.deepEqual((error as AnyRecord).partiallyWritten, [])
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), changed)
+  assert.deepEqual((await readdir(root)).sort(), ["a.ts", "b.ts"])
+})
+
 test("stale Tag rejects with MismatchError before any write", async () => {
   const harness = await createHarness({
     directory: root,
@@ -375,6 +503,163 @@ test("stale Tag rejects with MismatchError before any write", async () => {
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
 })
 
+test("an unread alias cannot use a Snapshot minted for another path", async () => {
+  await symlink(path.join(root, "a.ts"), path.join(root, "alias.ts"))
+  const harness = await createHarness({
+    directory: root,
+    options: { enforceSeenLines: false },
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+  const reading = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
+  await assert.rejects(
+    editTool(harness.tools).execute({ patch: `[alias.ts#${reading.metadata.tag}]\nreplace 1\n+unsafe` }, CONTEXT),
+    (error: unknown) => error instanceof SnapshotRequiredError && /read first/.test(error.message),
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+})
+
+test("drift after preflight but before staging reports a fresh Tag and does not overwrite", async () => {
+  const changed = "external\ntwo\n"
+  const harness = await createHarness({
+    directory: root,
+    filesystem: new class extends FileSystemAdapter {
+      override async prepareAtomic(input: Parameters<FileSystemAdapter["prepareAtomic"]>[0]) {
+        await writeFile(path.join(root, "a.ts"), changed)
+        return super.prepareAtomic(input)
+      }
+    }({ root }),
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+  const reading = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
+  await assert.rejects(editTool(harness.tools).execute({ patch: `${reading.metadata.header}\nreplace 1\n+ONE` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof MismatchError)
+    assert.equal(error.actualTag, computeTag(changed))
+    assert.match(error.message, /re-read/)
+    assert.deepEqual((error as AnyRecord).written, [])
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), changed)
+  assert.deepEqual(await readdir(root), ["a.ts"])
+})
+
+test("two distinct read Snapshots with one colliding Tag cannot authorize an edit", async () => {
+  const byTag = new Map<string, string>()
+  let first = ""
+  let second = ""
+  for (let index = 0; index < 100_000 && !second; index += 1) {
+    const text = `collision-${index}\n`
+    const tag = computeTag(text)
+    const previous = byTag.get(tag)
+    if (previous && previous !== text) {
+      first = previous
+      second = text
+    } else byTag.set(tag, text)
+  }
+  assert.ok(first && second)
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), await readFile(path.join(root, String(input.path)), "utf8")) },
+  })
+  await writeFile(path.join(root, "a.ts"), first)
+  const reading = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
+  await writeFile(path.join(root, "a.ts"), second)
+  const collision = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
+  assert.equal(reading.metadata.tag, collision.metadata.tag)
+  await writeFile(path.join(root, "a.ts"), first)
+
+  await assert.rejects(editTool(harness.tools).execute({ patch: `${reading.metadata.header}\nreplace 1\n+unsafe` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof MismatchError)
+    assert.equal(error.actualTag, reading.metadata.tag)
+    assert.match(error.message, /re-read/)
+    assert.deepEqual((error as AnyRecord).written, [])
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), first)
+})
+
+test("options evict old versions, old paths, and over-budget Snapshots without disabling freshness", async () => {
+  await writeFile(path.join(root, "b.ts"), "other\n")
+  const nativeRead = { execute: async (input: AnyRecord) => nativeTextResult(String(input.path), await readFile(path.join(root, String(input.path)), "utf8")) }
+  const versions = await createHarness({ directory: root, options: { maxVersionsPerPath: 1 }, nativeRead })
+  const first = await readTool(versions.tools).execute({ path: "a.ts" }, CONTEXT)
+  await writeFile(path.join(root, "a.ts"), "new\ntwo\n")
+  await readTool(versions.tools).execute({ path: "a.ts" }, CONTEXT)
+  await writeFile(path.join(root, "a.ts"), "one\ntwo\n")
+  await assert.rejects(editTool(versions.tools).execute({ patch: `${first.metadata.header}\nreplace 1\n+unsafe` }, CONTEXT), (error: unknown) => error instanceof MismatchError)
+
+  const paths = await createHarness({ directory: root, options: { maxPaths: 1 }, nativeRead })
+  const a = await readTool(paths.tools).execute({ path: "a.ts" }, CONTEXT)
+  await readTool(paths.tools).execute({ path: "b.ts" }, CONTEXT)
+  await assert.rejects(editTool(paths.tools).execute({ patch: `${a.metadata.header}\nreplace 1\n+unsafe` }, CONTEXT), (error: unknown) => error instanceof MismatchError)
+
+  const bytes = await createHarness({ directory: root, options: { maxTotalBytes: 7 }, nativeRead })
+  await assert.rejects(readTool(bytes.tools).execute({ path: "a.ts" }, CONTEXT), /SnapshotStore limit/)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+})
+
+test("preflight rejects a stale later section and a duplicate canonical path without writing", async () => {
+  await writeFile(path.join(root, "b.ts"), "alpha\n")
+  await symlink(path.join(root, "a.ts"), path.join(root, "alias.ts"))
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), await readFile(path.join(root, String(input.path)), "utf8")) },
+  })
+  const read = readTool(harness.tools)
+  const edit = editTool(harness.tools)
+  const a = await read.execute({ path: "a.ts" }, CONTEXT)
+  const b = await read.execute({ path: "b.ts" }, CONTEXT)
+  const alias = await read.execute({ path: "alias.ts" }, CONTEXT)
+  await writeFile(path.join(root, "b.ts"), "changed\n")
+
+  await assert.rejects(edit.execute({ patch: `${a.metadata.header}\nreplace 1\n+ONE\n${b.metadata.header}\nreplace 1\n+ALPHA` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof MismatchError)
+    assert.equal(error.actualTag, computeTag("changed\n"))
+    assert.match(error.message, /re-read/)
+    assert.deepEqual((error as AnyRecord).written, [])
+    return true
+  })
+  await assert.rejects(edit.execute({ patch: `${a.metadata.header}\nreplace 1\n+ONE\n${alias.metadata.header}\nreplace 2\n+TWO` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof DuplicatePathError)
+    assert.deepEqual((error as AnyRecord).written, [])
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "changed\n")
+})
+
+test("unsupported operations and no-op edits fail through the tool before writing", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+  const header = (await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)).metadata.header
+  for (const operation of ["PUT 1", ".= 1", "CUT 1", "REM", "MV b.ts", "replace 1*", "@name"]) {
+    await assert.rejects(editTool(harness.tools).execute({ patch: `${header}\n${operation}` }, CONTEXT), (error: unknown) => {
+      assert.ok(error instanceof PatchSyntaxError)
+      assert.match(error.message, /v1 alternative: replace N-M or replace N/)
+      assert.deepEqual((error as AnyRecord).written, [])
+      return true
+    })
+  }
+  await assert.rejects(editTool(harness.tools).execute({ patch: `${header}\nreplace 1\n+one` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof NoChangesError)
+    assert.match(error.message, /resulted in no changes/)
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+})
+
+test("edit preserves BOM and CRLF and writes a literal empty body line", async () => {
+  await writeFile(path.join(root, "a.ts"), "\uFEFFone\r\ntwo\r\n")
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async () => nativeTextResult("a.ts", "one\ntwo\n") },
+  })
+  const reading = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
+  await editTool(harness.tools).execute({ patch: `${reading.metadata.header}\nreplace 2\n+` }, CONTEXT)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "\uFEFFone\r\n\r\n")
+})
+
 test("text outside the Snapshot Root refuses instead of returning an untagged read", async () => {
   const harness = await createHarness({
     directory: root,
@@ -387,6 +672,73 @@ test("text outside the Snapshot Root refuses instead of returning an untagged re
     readTool(harness.tools).execute({ path: path.join(outside, "secret.ts") }, CONTEXT),
     (error: unknown) => error instanceof BoundaryError,
   )
+})
+
+test("relative escapes, absolute outside paths, and outward symlinks refuse read and edit without disclosure", async () => {
+  const link = path.join(root, "escape.ts")
+  await symlink(path.join(outside, "secret.ts"), link)
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "secret\n") },
+  })
+  const tag = computeTag("secret\n")
+  const targets = [path.relative(root, path.join(outside, "secret.ts")), path.join(outside, "secret.ts"), "escape.ts"]
+  for (const target of targets) {
+    await assert.rejects(readTool(harness.tools).execute({ path: target }, CONTEXT), (error: unknown) => {
+      assert.ok(error instanceof BoundaryError)
+      assert.doesNotMatch(error.message, /File does not exist|secret\n/i)
+      return true
+    })
+    await assert.rejects(editTool(harness.tools).execute({ patch: `[${target}#${tag}]\nreplace 1\n+leak` }, CONTEXT), (error: unknown) => {
+      assert.ok(error instanceof BoundaryError)
+      assert.deepEqual((error as AnyRecord).written, [])
+      assert.doesNotMatch(error.message, /File does not exist|secret\n/i)
+      return true
+    })
+  }
+  assert.equal(harness.nativeCalls.length, 0)
+  assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
+})
+
+test("a symlink switched outside after read or before rename cannot write beyond the Snapshot Root", async () => {
+  const link = path.join(root, "link.ts")
+  await symlink(path.join(root, "a.ts"), link)
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+  const read = await readTool(harness.tools).execute({ path: "link.ts" }, CONTEXT)
+  await rm(link)
+  await symlink(path.join(outside, "secret.ts"), link)
+  await assert.rejects(editTool(harness.tools).execute({ patch: `${read.metadata.header}\nreplace 1\n+unsafe` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof BoundaryError)
+    assert.deepEqual((error as AnyRecord).written, [])
+    assert.doesNotMatch(error.message, /secret|exist/i)
+    return true
+  })
+
+  await rm(link)
+  await symlink(path.join(root, "a.ts"), link)
+  const race = await createHarness({
+    directory: root,
+    filesystem: new class extends FileSystemAdapter {
+      override async commitPrepared(prepared: Parameters<FileSystemAdapter["commitPrepared"]>[0]) {
+        await rm(link)
+        await symlink(path.join(outside, "secret.ts"), link)
+        return super.commitPrepared(prepared)
+      }
+    }({ root }),
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+  const second = await readTool(race.tools).execute({ path: "link.ts" }, CONTEXT)
+  await assert.rejects(editTool(race.tools).execute({ patch: `${second.metadata.header}\nreplace 1\n+unsafe` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof BoundaryError)
+    assert.deepEqual((error as AnyRecord).written, [])
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+  assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
+  assert.deepEqual((await readdir(root)).sort(), ["a.ts", "link.ts"])
 })
 
 test("window reads keep absolute line numbers and union SeenLines across reads", async () => {
@@ -477,6 +829,37 @@ test("native byte-limited page bounds the tagged window and SeenLines", async ()
     editTool(harness.tools).execute({ patch: `${result.metadata.header}\nreplace 3\n+THREE` }, CONTEXT),
     (error: unknown) => error instanceof SeenLinesError,
   )
+})
+
+test("unseen Anchors reveal up to forty lines; truncated previews do not authorize retry", async () => {
+  const lines = Array.from({ length: 50 }, (_, index) => `line-${index + 1}`)
+  await writeFile(path.join(root, "a.ts"), `${lines.join("\n")}\n`)
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), `${lines.join("\n")}\n`) },
+  })
+  const reading = await readTool(harness.tools).execute({ path: "a.ts", limit: 1 }, CONTEXT)
+  const edit = editTool(harness.tools)
+  const truncatedPatch = `${reading.metadata.header}\nreplace 2-42\n+changed`
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await assert.rejects(edit.execute({ patch: truncatedPatch }, CONTEXT), (error: unknown) => {
+      assert.ok(error instanceof SeenLinesError)
+      assert.equal(error.revealed.length, 40)
+      assert.equal(error.revealed[0].text, "line-2")
+      assert.equal(error.truncated, true)
+      assert.deepEqual((error as AnyRecord).written, [])
+      return true
+    })
+  }
+  const shortPatch = `${reading.metadata.header}\nreplace 2\n+TWO`
+  await assert.rejects(edit.execute({ patch: shortPatch }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof SeenLinesError)
+    assert.deepEqual(error.revealed, [{ line: 2, text: "line-2" }])
+    assert.equal(error.truncated, false)
+    return true
+  })
+  await edit.execute({ patch: shortPatch }, CONTEXT)
+  assert.equal((await readFile(path.join(root, "a.ts"), "utf8")).split("\n")[1], "TWO")
 })
 
 test("native NFC alternate path becomes the tagged editable path", async () => {

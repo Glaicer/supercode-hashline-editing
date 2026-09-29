@@ -6,6 +6,7 @@ import { HashlineService } from "./service.ts"
 import type { EditResult, ReadResult } from "./service.ts"
 import { InMemorySnapshotStore, SnapshotStoreLimits } from "./snapshots.ts"
 import { FileNotFoundError, isInside } from "./filesystem.ts"
+import type { FileSystemAdapter } from "./filesystem.ts"
 import { BoundaryError } from "./errors.ts"
 import type { Info, Result, ToolContext, ToolEditor } from "@opencode/plugin/promise/tool"
 
@@ -293,7 +294,7 @@ function makeEditTool({ service }: { service: HashlineService }): Info {
   }
 }
 
-export async function setupHashlinePlugin(input: HashlinePluginInput): Promise<() => Promise<void>> {
+export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem?: FileSystemAdapter): Promise<() => Promise<void>> {
   const directory = path.resolve(input.location.directory)
   const settings = resolveHashlineSettings(input.options, directory)
   const assertBoundary = readBoundary(directory, await Promise.all([directory, ...settings.roots].map((root) => realpath(root))))
@@ -306,6 +307,7 @@ export async function setupHashlinePlugin(input: HashlinePluginInput): Promise<(
     worktree: directory,
     directory,
     roots: settings.roots,
+    filesystem,
     store,
     enforceSeenLines: settings.enforceSeenLines,
   })
