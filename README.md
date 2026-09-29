@@ -27,6 +27,18 @@ Reads take `limit` and `offset`. For inserts use `insert before N`, `insert afte
 - If the file changed on disk, the edit stops before writing anything. Read again and retry.
 - No fuzzy matching. The tag either matches or it does not.
 
+## WARNING: edit permissions are not enforced
+
+Hashline `edit` cannot ask OpenCode for permission at write time — the plugin API has no such mechanism (`ctx.permission` can list and answer requests, not create them). Unlike the native `edit` and `write` tools, which do park for approval, hashline writes directly. Measured on OpenCode 2.0.18:
+
+- `edit: ask` rules do **not** park for approval. Every hashline edit is treated as `allow` and writes immediately.
+- `edit: deny` rules naming paths (for example `**/src/secrets/**`) are **not** enforced. A blanket `edit: deny *` blocks hashline edits, but only because OpenCode hides the tool from the model entirely — it is not a check inside `edit`.
+- `read` is unaffected: it delegates to the native read tool, which honors `read` permissions as usual.
+
+If you rely on edit approvals or path-scoped edit denials, do not use this plugin for those files — or wrap the workflow in your own review process. Use at your own risk.
+
+The Snapshot Root boundary still confines every read and edit to the project root and configured `roots`, and a stale tag still refuses to write. Those protect against writing outside the root and to the wrong version of a file; they are not an approval policy.
+
 ## Install
 
 Install with the OpenCode CLI:
