@@ -45,7 +45,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode/plugin": "2.0.18"
+    "@opencode/plugin": "2.0.18",
+    "effect": "4.0.0-rc.112"
   },
   "devDependencies": {
     "@babel/core": "7.28.0",

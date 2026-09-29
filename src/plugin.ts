@@ -2,6 +2,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { realpath } from "node:fs/promises"
 
+import { Schema } from "effect"
 import { HashlineService } from "./service.ts"
 import type { EditResult, ReadResult } from "./service.ts"
 import { InMemorySnapshotStore, SnapshotStoreLimits } from "./snapshots.ts"
@@ -12,6 +13,10 @@ import type { Info, Result, ToolContext, ToolEditor } from "@opencode/plugin/pro
 
 const READ_NAME = "read"
 const EDIT_NAME = "edit"
+const WRITE_NAME = "write"
+const PATCH_NAME = "patch"
+
+const SURFACE_HOOK_NAMES = ["context", "compaction", "generate"] as const
 
 const MAX_READ_LINES = 2_000
 // shortcut: leave headroom under the host's default 50 KiB tool-output cap; revisit if the effective cap becomes available to plugins.
@@ -136,12 +141,34 @@ export function resolveHashlineSettings(raw: unknown, directory: string): Hashli
   }
 }
 
+export type SurfaceHookName = (typeof SURFACE_HOOK_NAMES)[number]
+
+export interface SurfaceToolEntry {
+  readonly description: string
+  readonly input: unknown
+}
+
+export interface SurfaceEvent {
+  tools: Record<string, SurfaceToolEntry>
+}
+
+export interface HashlineToolEntry extends SurfaceToolEntry {
+  readonly id: string
+}
+
 export interface HashlinePluginInput {
   readonly location: { readonly directory: string }
   readonly options: unknown
   readonly tool: {
     readonly transform: (
       callback: (editor: ToolEditor) => void,
+    ) => Promise<{ readonly dispose: () => Promise<void> }>
+    readonly list: () => Promise<readonly HashlineToolEntry[]>
+  }
+  readonly session: {
+    readonly hook: (
+      name: SurfaceHookName,
+      callback: (event: SurfaceEvent) => Promise<void> | void,
     ) => Promise<{ readonly dispose: () => Promise<void> }>
   }
 }
@@ -294,6 +321,27 @@ function makeEditTool({ service }: { service: HashlineService }): Info {
   }
 }
 
+function surfaceInputJson(input: unknown): unknown {
+  if (input === undefined || input === null) return {}
+  if (!Schema.isSchema(input)) return input
+  const document = Schema.toJsonSchemaDocument(input)
+  return Object.keys(document.definitions).length === 0
+    ? document.schema
+    : { ...document.schema, $defs: document.definitions }
+}
+
+function makeSurfaceHook(list: HashlinePluginInput["tool"]["list"]): (event: SurfaceEvent) => Promise<void> {
+  return async (event) => {
+    delete event.tools[PATCH_NAME]
+    const listed = await list()
+    for (const name of [EDIT_NAME, WRITE_NAME]) {
+      if (event.tools[name]) continue
+      const source = listed.find((tool) => tool.id === name)
+      if (source) event.tools[name] = { description: source.description, input: surfaceInputJson(source.input) }
+    }
+  }
+}
+
 export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem?: FileSystemAdapter): Promise<() => Promise<void>> {
   const directory = path.resolve(input.location.directory)
   const settings = resolveHashlineSettings(input.options, directory)
@@ -317,5 +365,12 @@ export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem
     editor.add(makeReadTool({ service, nativeRead, assertBoundary }))
     editor.add(makeEditTool({ service }))
   })
-  return () => registration.dispose()
+  const surfaceHook = makeSurfaceHook(input.tool.list)
+  const hookRegistrations = await Promise.all(
+    SURFACE_HOOK_NAMES.map((name) => input.session.hook(name, surfaceHook)),
+  )
+  return async () => {
+    await registration.dispose()
+    for (const hookRegistration of hookRegistrations) await hookRegistration.dispose()
+  }
 }

@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node
 import { tmpdir } from "node:os"
 import path from "node:path"
 
+import { Schema } from "effect"
 import { resolveHashlineSettings, setupHashlinePlugin } from "./plugin.ts"
 import { computeTag } from "./hash.ts"
 import { BoundaryError, DuplicatePathError, MismatchError, NoChangesError, SeenLinesError, SnapshotRequiredError } from "./errors.ts"
@@ -46,6 +47,110 @@ function createFakeEditor() {
       tools.delete(id)
     },
   }
+}
+
+const NATIVE_WRITE_DESCRIPTION = "Create or overwrite a file with the given content."
+
+// Mirrors the native write tool's Effect Schema input (packages/core/src/tool/plugin/write.ts).
+const NATIVE_WRITE_INPUT = Schema.Struct({
+  path: Schema.String.annotate({ description: "Path to the file to create or overwrite" }),
+  content: Schema.String.annotate({ description: "Full file content to write" }),
+})
+
+const NATIVE_WRITE_JSON = {
+  type: "object",
+  properties: {
+    path: { type: "string", description: "Path to the file to create or overwrite" },
+    content: { type: "string", description: "Full file content to write" },
+  },
+  required: ["path", "content"],
+  additionalProperties: false,
+}
+
+const DEFINED_INNER = Schema.Struct({ x: Schema.String }).annotate({ identifier: "Inner" })
+
+const DEFINED_INPUT = Schema.Struct({ inner: DEFINED_INNER, more: Schema.String })
+
+const DEFINED_INPUT_JSON = {
+  type: "object",
+  properties: {
+    inner: { $ref: "#/$defs/Inner" },
+    more: { type: "string" },
+  },
+  required: ["inner", "more"],
+  additionalProperties: false,
+  $defs: {
+    Inner: {
+      type: "object",
+      properties: { x: { type: "string" } },
+      required: ["x"],
+      additionalProperties: false,
+    },
+  },
+}
+
+function addFakeBuiltins(target: ReturnType<typeof createFakeEditor>) {
+  target.add({
+    name: "write",
+    description: NATIVE_WRITE_DESCRIPTION,
+    input: NATIVE_WRITE_INPUT,
+    execute: async () => ({ content: "written" }),
+  })
+  target.add({
+    name: "patch",
+    description: "Apply a patch to files",
+    input: { type: "object", properties: { patch: { type: "string" } }, required: ["patch"], additionalProperties: false },
+    execute: async () => ({ content: "patched" }),
+  })
+}
+
+type SurfaceCallback = (event: AnyRecord) => Promise<void> | void
+
+function createFakeSession() {
+  const hooks = new Map<string, Set<SurfaceCallback>>()
+  let activeCount = 0
+  return {
+    hook: async (name: string, callback: SurfaceCallback) => {
+      const bucket = hooks.get(name) ?? new Set<SurfaceCallback>()
+      hooks.set(name, bucket)
+      bucket.add(callback)
+      activeCount += 1
+      return {
+        dispose: async () => {
+          if (bucket.delete(callback)) activeCount -= 1
+        },
+      }
+    },
+    activeCount: () => activeCount,
+    deliver: async (name: string, event: AnyRecord) => {
+      for (const callback of hooks.get(name) ?? []) await callback(event)
+    },
+  }
+}
+
+// Mirrors how the host builds the hook record from tool definitions
+// (packages/core/src/session/model-request.ts:219 with tool/runtime.ts inputJsonSchema).
+function hostInputJson(input: unknown): unknown {
+  if (input === undefined || input === null) return {}
+  if (!Schema.isSchema(input)) return input
+  return Schema.toJsonSchemaDocument(input).schema
+}
+
+function surfaceRecord(tools: Map<string, AnyRecord>): Record<string, AnyRecord> {
+  return Object.fromEntries(
+    [...tools.values()].map((tool) => [tool.name, { description: tool.description, input: hostInputJson(tool.input) }]),
+  )
+}
+
+// Mirrors the built-in PatchTool context hook in packages/core/src/tool/plugin/patch.ts:296-309.
+function builtinPatchGating(modelID: string, tools: Record<string, AnyRecord>) {
+  const usePatch = modelID.includes("gpt-") && !modelID.includes("oss") && !modelID.includes("gpt-4")
+  if (usePatch) {
+    delete tools.edit
+    delete tools.write
+    return
+  }
+  delete tools.patch
 }
 
 interface NativeReadBehavior {
@@ -112,12 +217,15 @@ interface Harness {
   nativeCalls: Array<{ input: AnyRecord; context: ToolContextLike }>
   cleanup: () => Promise<void>
   disposed: () => boolean
+  hooksActive: () => number
+  dispatchSurface: (modelID: string, hookName?: string) => Promise<Record<string, AnyRecord>>
   replay: (withNative?: boolean) => Map<string, AnyRecord>
 }
 
 async function createHarness({ directory, options, nativeRead, filesystem }: HarnessInput): Promise<Harness> {
   const editor = createFakeEditor()
   const nativeCalls: Array<{ input: AnyRecord; context: ToolContextLike }> = []
+  addFakeBuiltins(editor)
   const addNativeRead = (target: ReturnType<typeof createFakeEditor>) => {
     if (!nativeRead) return
     target.add({
@@ -133,6 +241,7 @@ async function createHarness({ directory, options, nativeRead, filesystem }: Har
   }
   addNativeRead(editor)
 
+  const session = createFakeSession()
   const transforms: Array<(target: ReturnType<typeof createFakeEditor>) => void> = []
   let disposeCount = 0
   const ctx = {
@@ -141,10 +250,19 @@ async function createHarness({ directory, options, nativeRead, filesystem }: Har
     tool: {
       transform: async (callback: (target: ReturnType<typeof createFakeEditor>) => void) => {
         transforms.push(callback)
+        const before = new Map(editor.tools)
         callback(editor)
-        return { dispose: async () => void (disposeCount += 1) }
+        return {
+          dispose: async () => {
+            disposeCount += 1
+            editor.tools.clear()
+            for (const [id, tool] of before) editor.tools.set(id, tool)
+          },
+        }
       },
+      list: async () => editor.list(),
     },
+    session: { hook: session.hook },
   } as unknown as Parameters<typeof setupHashlinePlugin>[0]
 
   const cleanup = await setupHashlinePlugin(ctx, filesystem)
@@ -153,8 +271,17 @@ async function createHarness({ directory, options, nativeRead, filesystem }: Har
     nativeCalls,
     cleanup,
     disposed: () => disposeCount > 0,
+    hooksActive: session.activeCount,
+    dispatchSurface: async (modelID, hookName = "context") => {
+      const tools = surfaceRecord(editor.tools)
+      builtinPatchGating(modelID, tools)
+      const event = { model: { id: modelID }, tools }
+      await session.deliver(hookName, event)
+      return event.tools
+    },
     replay: (withNative = true) => {
       const fresh = createFakeEditor()
+      addFakeBuiltins(fresh)
       if (withNative) addNativeRead(fresh)
       for (const callback of transforms) callback(fresh)
       return fresh.tools
@@ -970,7 +1097,7 @@ test("plugin options apply: roots extend the Snapshot Root and the guard can be 
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
 })
 
-test("two Locations get isolated snapshot stores", async () => {
+test("two Locations get isolated snapshot stores and rootIds", async () => {
   const harnessA = await createHarness({
     directory: root,
     nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
@@ -993,6 +1120,9 @@ test("two Locations get isolated snapshot stores", async () => {
       (error: unknown) => error instanceof SnapshotRequiredError,
     )
     assert.equal(await readFile(path.join(directoryB, "a.ts"), "utf8"), "one\ntwo\n")
+
+    const readB = await readTool(harnessB.tools).execute({ path: "a.ts" }, CONTEXT)
+    assert.notEqual(readA.metadata.rootId, readB.metadata.rootId)
 
     await editTool(harnessA.tools).execute(
       { patch: `${headerA}\nreplace 1\n+ONE` },
@@ -1032,7 +1162,7 @@ test("transform replay re-captures the native executor per run", async () => {
   )
 })
 
-test("cleanup disposes the tool registration", async () => {
+test("cleanup disposes the tool registration and returns the native tools", async () => {
   const harness = await createHarness({
     directory: root,
     nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
@@ -1040,6 +1170,82 @@ test("cleanup disposes the tool registration", async () => {
   assert.equal(harness.disposed(), false)
   await harness.cleanup()
   assert.equal(harness.disposed(), true)
+  assert.equal(harness.tools.get("read")?.description, "native read")
+  assert.equal(harness.tools.has("edit"), false)
+})
+
+test("surface hooks expose hashline read/edit plus native write without patch on any model", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+
+  const surface = await harness.dispatchSurface("probe-model")
+  assert.deepEqual(Object.keys(surface).sort(), ["edit", "read", "write"])
+  assert.match(surface.read.description, /Tag from this output/)
+  assert.match(surface.edit.description, /hashline patch/)
+  assert.equal(surface.edit.input, editTool(harness.tools).input)
+  assert.equal(surface.write.description, NATIVE_WRITE_DESCRIPTION)
+  assert.deepEqual(surface.write.input, NATIVE_WRITE_JSON)
+})
+
+test("gpt-family gating deletions are restored to the same surface by the plugin hook", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+
+  const gated = surfaceRecord(harness.tools)
+  builtinPatchGating("gpt-probe", gated)
+  assert.deepEqual(Object.keys(gated).sort(), ["patch", "read"])
+
+  const surface = await harness.dispatchSurface("gpt-probe")
+  assert.deepEqual(Object.keys(surface).sort(), ["edit", "read", "write"])
+  assert.match(surface.edit.description, /hashline patch/)
+  assert.equal(surface.write.description, NATIVE_WRITE_DESCRIPTION)
+  assert.deepEqual(await harness.dispatchSurface("probe-model"), surface)
+})
+
+test("surface hooks cover context, compaction, and generate and do not leak after unload", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+
+  for (const name of ["context", "compaction", "generate"]) {
+    const surface = await harness.dispatchSurface("gpt-probe", name)
+    assert.deepEqual(Object.keys(surface).sort(), ["edit", "read", "write"], `hook ${name}`)
+  }
+  assert.equal(harness.hooksActive(), 3)
+
+  await harness.cleanup()
+  assert.equal(harness.hooksActive(), 0)
+  const leaked = await harness.dispatchSurface("gpt-probe")
+  assert.deepEqual(Object.keys(leaked).sort(), ["patch", "read"])
+})
+
+test("a tool missing from the registry is left off the surface instead of invented", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+  harness.tools.delete("write")
+
+  const surface = await harness.dispatchSurface("gpt-probe")
+  assert.deepEqual(Object.keys(surface).sort(), ["edit", "read"])
+})
+
+test("a restored schema input with definitions keeps its $defs references resolvable", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+  const write = harness.tools.get("write")
+  assert.ok(write)
+  harness.tools.set("write", { ...write, input: DEFINED_INPUT })
+
+  const surface = await harness.dispatchSurface("gpt-probe")
+  assert.deepEqual(surface.write.input, DEFINED_INPUT_JSON)
 })
 
 test("resolveHashlineSettings validates roots and defaults the rest", () => {
