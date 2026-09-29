@@ -2,7 +2,7 @@
 
 An OpenCode plugin that edits files by line number instead of search and replace. Search and replace breaks when the same code shows up twice. Plain line numbers break when an earlier edit moves the lines below it.
 
-The installation instructions below describe the released V1 package (`0.1.0`). This checkout contains an in-progress OpenCode V2 port; do not use the V1 commands below to install this development build. V2 packaging and migration instructions are tracked in ticket 05.
+Version `1.0.0` targets OpenCode V2 (2.x). The V1 release (`0.1.0`) stays as-is for OpenCode 1.x hosts; the two are separate artifacts and nothing migrates automatically.
 
 ## What it does
 
@@ -44,20 +44,63 @@ The Snapshot Root boundary still confines every read and edit to the project roo
 Install with the OpenCode CLI:
 
 ```bash
-opencode plugin @glaicer/supercode-hashline-editing --global
+opencode plugin add @glaicer/supercode-hashline-editing
 ```
 
-- `--global` installs into the global config (`~/.config/opencode`); default is local (`.opencode` in the current project).
-- `--force` replaces an already-installed version.
-- Restart OpenCode after installing.
+This exact command was verified on OpenCode 2.0.18. It installs the package into OpenCode's plugin cache and appends the bare package name to the `plugins` array of your global OpenCode config (`~/.config/opencode/opencode.json` or `opencode.jsonc`). Then restart OpenCode — config is only read when a location boots, so already-running sessions keep their old tool surface.
 
-Manual install also works: add the package to the `plugin` array in `opencode.json`:
+## Settings and migrating from V1
 
-```json
+Options travel inside the `plugins` entry of the global config. `opencode plugin add` writes the bare package name; to set options, expand that entry to the object form shown below. Every option is optional, and the defaults match V1:
+
+| option | default | meaning |
+| --- | --- | --- |
+| `enforceSeenLines` | `true` | refuse to edit lines a `read` never showed |
+| `roots` | `[]` | additional Snapshot Roots besides the project root |
+| `maxPaths` | `256` | tracked-file limit of the snapshot store |
+| `maxVersionsPerPath` | `4` | remembered versions per file |
+| `maxTotalBytes` | `67108864` | total snapshot budget in bytes |
+
+Before — V1 (`0.1.0`) read a `hashline` section of the config (OpenCode 1.x):
+
+```jsonc
 {
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@glaicer/supercode-hashline-editing"]
+  "hashline": {
+    "enabled": true,
+    "enforceSeenLines": true,
+    "roots": [],
+    "maxPaths": 256,
+    "maxVersionsPerPath": 4,
+    "maxTotalBytes": 67108864
+  }
 }
 ```
 
-Restart OpenCode after saving.
+After — V2 (`1.0.0`) takes the same values as `options` of the `plugins` entry; the `hashline` section is no longer read, so delete it:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "@glaicer/supercode-hashline-editing",
+      "options": {
+        "enforceSeenLines": true,
+        "roots": [],
+        "maxPaths": 256,
+        "maxVersionsPerPath": 4,
+        "maxTotalBytes": 67108864
+      }
+    }
+  ]
+}
+```
+
+## Disable
+
+The `enabled` flag is gone. To turn the plugin off, remove its entry from `plugins` and restart the location (boot a fresh session). Config edits never reach already-running locations, so the restart is required; afterwards the native `read`/`edit`/`patch` tools are back.
+
+## Differences from the native edit tools
+
+- **Only existing files.** Hashline `edit` patches files that exist and were read. Creating a file is the native `write` tool's job.
+- **No formatting.** The native `edit` and `write` tools run the configured formatter after writing; hashline `edit` writes exactly the lines you asked for and never formats or restyles code.
+- **No edit approval.** Hashline `edit` writes without asking. See the WARNING above before relying on edit permissions.
