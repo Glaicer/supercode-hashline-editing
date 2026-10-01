@@ -1,14 +1,8 @@
 # hashline-editing
 
-An OpenCode plugin that edits files by line number instead of search and replace. Search and replace breaks when the same code shows up twice. Plain line numbers break when an earlier edit moves the lines below it.
+An OpenCode plugin that edits files by line number instead of search and replace.
 
-Version `1.0.0` targets OpenCode V2 (2.x). The V1 release (`0.1.0`) stays as-is for OpenCode 1.x hosts; the two are separate artifacts and nothing migrates automatically.
-
-## What it does
-
-Each `read` returns a `[PATH#TAG]` header. The tag names the exact version you read, so `edit` can check it before it writes.
-
-Read a file first, then send a patch like this:
+Search and replace breaks when the same code appears twice. Plain line numbers break when an earlier edit shifts the lines below. Hashline avoids both: every `read` returns a `[PATH#TAG]` header that pins the exact version you saw, and `edit` checks that tag before writing anything.
 
 ```text
 [src/a.ts#A1B2]
@@ -17,41 +11,42 @@ replace 2-3
 +new line three
 ```
 
-Reads take `limit` and `offset`. For inserts use `insert before N`, `insert after N`, or `append`. One patch can cover several files. Every file is checked first, then written.
-
-## Benefits
-
-- Edits in one patch never shift each other. Line numbers refer to the version you read. Use the new header for the next edit.
-- Duplicate lines are safe because you point at lines, not text. A stale tag stops instead of writing to the wrong place.
-- Patches stay small. You send only the operation and the new lines, no surrounding context.
-- If the file changed on disk, the edit stops before writing anything. Read again and retry.
-- No fuzzy matching. The tag either matches or it does not.
-
-## WARNING: edit permissions are not enforced
-
-Hashline `edit` cannot ask OpenCode for permission at write time — the plugin API has no such mechanism (`ctx.permission` can list and answer requests, not create them). Unlike the native `edit` and `write` tools, which do park for approval, hashline writes directly. Measured on OpenCode 2.0.18:
-
-- `edit: ask` rules do **not** park for approval. Every hashline edit is treated as `allow` and writes immediately.
-- `edit: deny` rules naming paths (for example `**/src/secrets/**`) are **not** enforced. A blanket `edit: deny *` blocks hashline edits, but only because OpenCode hides the tool from the model entirely — it is not a check inside `edit`.
-- `read` is unaffected: it delegates to the native read tool, which honors `read` permissions as usual.
-
-If you rely on edit approvals or path-scoped edit denials, do not use this plugin for those files — or wrap the workflow in your own review process. Use at your own risk.
-
-The Snapshot Root boundary still confines every read and edit to the project root and configured `roots`, and a stale tag still refuses to write. Those protect against writing outside the root and to the wrong version of a file; they are not an approval policy.
+Operations: `replace N-M`, `replace N`, `insert before N`, `insert after N`, `append`. New lines are prefixed with `+`. One patch can cover several files — everything is validated first, then written. If the file changed on disk since your read, the tag won't match and nothing is written: read again and retry.
 
 ## Install
 
-Install with the OpenCode CLI:
+**OpenCode v2 (2.x)** — version `1.0.0`:
 
 ```bash
 opencode plugin add @glaicer/supercode-hashline-editing
 ```
 
-This exact command was verified on OpenCode 2.0.18. It installs the package into OpenCode's plugin cache and appends the bare package name to the `plugins` array of your global OpenCode config (`~/.config/opencode/opencode.json` or `opencode.jsonc`). Then restart OpenCode — config is only read when a location boots, so already-running sessions keep their old tool surface.
+**OpenCode v1 (1.x)** — version `0.1.0`. Add it to the `plugin` array of your `opencode.json`:
 
-## Settings and migrating from V1
+```json
+{
+  "plugin": ["@glaicer/supercode-hashline-editing@0.1.0"]
+}
+```
 
-Options travel inside the `plugins` entry of the global config. `opencode plugin add` writes the bare package name; to set options, expand that entry to the object form shown below. Every option is optional, and the defaults match V1:
+Restart OpenCode either way — running sessions don't pick up config changes. To uninstall, remove the plugin entry and restart again.
+
+## Options
+
+v2 reads options from the `plugins` entry in the global config:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "@glaicer/supercode-hashline-editing",
+      "options": { "enforceSeenLines": true }
+    }
+  ]
+}
+```
+
+v1 reads the same values from a `hashline` section of the config.
 
 | option | default | meaning |
 | --- | --- | --- |
@@ -61,46 +56,14 @@ Options travel inside the `plugins` entry of the global config. `opencode plugin
 | `maxVersionsPerPath` | `4` | remembered versions per file |
 | `maxTotalBytes` | `67108864` | total snapshot budget in bytes |
 
-Before — V1 (`0.1.0`) read a `hashline` section of the config (OpenCode 1.x):
+## Warning: edit permissions are not enforced
 
-```jsonc
-{
-  "hashline": {
-    "enabled": true,
-    "enforceSeenLines": true,
-    "roots": [],
-    "maxPaths": 256,
-    "maxVersionsPerPath": 4,
-    "maxTotalBytes": 67108864
-  }
-}
-```
+Hashline `edit` writes directly — the plugin API has no way to ask OpenCode for approval at write time. `edit: ask` rules won't prompt, and path-scoped `edit: deny` rules won't block it (measured on OpenCode 2.0.18). Only a blanket `edit: deny *` stops it, and only because the tool is then hidden from the model entirely. Reads are unaffected — they go through the native read tool and honor `read` permissions.
 
-After — V2 (`1.0.0`) takes the same values as `options` of the `plugins` entry; the `hashline` section is no longer read, so delete it:
-
-```jsonc
-{
-  "plugins": [
-    {
-      "package": "@glaicer/supercode-hashline-editing",
-      "options": {
-        "enforceSeenLines": true,
-        "roots": [],
-        "maxPaths": 256,
-        "maxVersionsPerPath": 4,
-        "maxTotalBytes": 67108864
-      }
-    }
-  ]
-}
-```
-
-## Disable
-
-The `enabled` flag is gone. To turn the plugin off, remove its entry from `plugins` and restart the location (boot a fresh session). Config edits never reach already-running locations, so the restart is required; afterwards the native `read`/`edit`/`patch` tools are back.
+If you rely on edit approvals, don't use this plugin for those files. Edits are still confined to the project root and configured `roots`, and a stale tag still refuses to write — but that's drift protection, not an approval policy.
 
 ## Differences from the native edit tools
 
-- **Only existing files.** Hashline `edit` patches files that exist and were read. Creating a file is the native `write` tool's job.
-- **No formatting.** The native `edit` and `write` tools run the configured formatter after writing; hashline `edit` writes exactly the lines you asked for and never formats or restyles code.
-- **No edit approval.** Hashline `edit` writes without asking. See the WARNING above before relying on edit permissions.
+- **Existing files only.** Creating files is the native `write` tool's job.
+- **No formatting.** Hashline writes exactly the lines you sent and never runs a formatter.
+- **No approval prompt.** See the warning above.
