@@ -338,6 +338,45 @@ test("setup overrides read/edit by name with native registration options", async
   assert.notEqual(editTool(harness.tools).input, undefined)
 })
 
+test("tool descriptions require verbatim headers and discourage bypassing rejected edits", async () => {
+  const harness = await createHarness({ directory: root })
+  for (const tool of [readTool(harness.tools), editTool(harness.tools)]) {
+    assert.match(tool.description, /entire `\[PATH#TAG\]` header.*verbatim/)
+    assert.match(tool.description, /Never shorten an absolute path/)
+    assert.match(tool.description, /Partial reads register valid Snapshots/)
+    assert.match(tool.description, /Do not bypass.*write.*shell/)
+  }
+})
+
+test("absolute reads recover from relative patch headers without rewriting the file", async () => {
+  const absolutePath = path.join(root, "a.ts")
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+  const read = readTool(harness.tools)
+  const edit = editTool(harness.tools)
+  let header = ""
+  for (const input of [{ path: absolutePath, limit: 1 }, { path: absolutePath }]) {
+    const reading = await read.execute(input, CONTEXT)
+    header = reading.metadata.header
+    await assert.rejects(
+      edit.execute({ patch: `[a.ts#${reading.metadata.tag}]\nreplace 1\n+ONE` }, CONTEXT),
+      (error: unknown) => {
+        assert.ok(error instanceof SnapshotRequiredError)
+        assert.equal(error.readHeader, header)
+        assert.ok(error.message.split("\n").includes(header))
+        assert.match(error.message, /path spelling/i)
+        assert.deepEqual((error as AnyRecord).written, [])
+        return true
+      },
+    )
+    assert.equal(await readFile(absolutePath, "utf8"), "one\ntwo\n")
+  }
+  await edit.execute({ patch: `${header}\nreplace 1\n+ONE` }, CONTEXT)
+  assert.equal(await readFile(absolutePath, "utf8"), "ONE\ntwo\n")
+})
+
 test("native read missing: read refuses loudly instead of degrading silently", async () => {
   const harness = await createHarness({ directory: root })
   const read = readTool(harness.tools)
@@ -640,7 +679,7 @@ test("an unread alias cannot use a Snapshot minted for another path", async () =
   const reading = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
   await assert.rejects(
     editTool(harness.tools).execute({ patch: `[alias.ts#${reading.metadata.tag}]\nreplace 1\n+unsafe` }, CONTEXT),
-    (error: unknown) => error instanceof SnapshotRequiredError && /read first/.test(error.message),
+    (error: unknown) => error instanceof SnapshotRequiredError && error.readHeader === reading.metadata.header && /path spelling/i.test(error.message),
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
 })
@@ -1182,7 +1221,7 @@ test("surface hooks expose hashline read/edit plus native write without patch on
 
   const surface = await harness.dispatchSurface("probe-model")
   assert.deepEqual(Object.keys(surface).sort(), ["edit", "read", "write"])
-  assert.match(surface.read.description, /Tag from this output/)
+  assert.match(surface.read.description, /entire `\[PATH#TAG\]` header.*verbatim/)
   assert.match(surface.edit.description, /hashline patch/)
   assert.equal(surface.edit.input, editTool(harness.tools).input)
   assert.equal(surface.write.description, NATIVE_WRITE_DESCRIPTION)

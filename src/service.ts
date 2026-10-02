@@ -362,7 +362,7 @@ export class HashlineService {
   directory: string
   enforceSeenLines: boolean
   filesystem: FileSystemAdapter
-  readCapabilities: Map<string, string>
+  readCapabilities: Map<string, { canonicalPath: string; header: string }>
   store: InMemorySnapshotStore
 
   constructor({
@@ -413,8 +413,8 @@ export class HashlineService {
       lineEnding: file.lineEnding,
       bom: file.bom,
     })
-    this.readCapabilities.set(capabilityKey(inputPath, file.rootId), file.canonicalPath)
     const header = formatHeader(inputPath, snapshot.tag)
+    this.readCapabilities.set(capabilityKey(inputPath, file.rootId), { canonicalPath: file.canonicalPath, header })
     const numbered = formatNumberedLines(visibleLines, firstLine)
     const output = numbered === "" ? header : `${header}\n${numbered}`
     return {
@@ -432,8 +432,16 @@ export class HashlineService {
 
   _resolveSnapshot(section: PatchSection, file: ReadFileResult): Snapshot {
     const capability = this.readCapabilities.get(capabilityKey(section.path, file.rootId))
-    if (!capability) throw new SnapshotRequiredError(section.path)
-    if (capability !== file.canonicalPath) {
+    if (!capability) {
+      const snapshot = this.store.resolve(file.canonicalPath, file.rootId, section.tag, file.text)
+      const rootPrefix = `${file.rootId}\u0000`
+      const readHeader = snapshot ? [...this.readCapabilities].find(([key, candidate]) =>
+        key.startsWith(rootPrefix) && candidate.canonicalPath === file.canonicalPath &&
+        candidate.header.endsWith(`#${snapshot.tag}]`),
+      )?.[1].header : undefined
+      throw new SnapshotRequiredError(section.path, readHeader)
+    }
+    if (capability.canonicalPath !== file.canonicalPath) {
       throw new MismatchError({
         path: section.path,
         expectedTag: section.tag,

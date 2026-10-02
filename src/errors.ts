@@ -38,10 +38,14 @@ export class MismatchError extends HashlineError {
 
 export class SnapshotRequiredError extends HashlineError {
   path: string
-  constructor(path: string) {
-    super(`No live Snapshot exists for ${path}; call read first, then edit using its header`)
+  readHeader?: string
+  constructor(path: string, readHeader?: string) {
+    super(readHeader
+      ? `Path spelling mismatch for ${path}; this file was read using a different path spelling. Use this read header verbatim:\n${readHeader}\nRetry with this exact header; do not shorten or normalize PATH or reconstruct TAG.`
+      : `No live Snapshot exists for ${path}; call read first, then copy its entire [PATH#TAG] header verbatim`)
     this.name = "SnapshotRequiredError"
     this.path = path
+    this.readHeader = readHeader
   }
 }
 

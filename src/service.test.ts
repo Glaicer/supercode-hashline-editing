@@ -284,6 +284,78 @@ test("edit requires a Snapshot minted by read", async () => {
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
 })
 
+test("path spelling mismatches suggest the exact read header for partial and full reads", async () => {
+  for (const absoluteRead of [true, false]) {
+    for (const limit of [1, undefined]) {
+      const current = new HashlineService({ worktree: root })
+      const absolutePath = path.join(root, "a.ts")
+      const reading = await current.read(absoluteRead ? absolutePath : "a.ts", limit)
+      const editPath = absoluteRead ? "a.ts" : absolutePath
+      await assert.rejects(
+        current.edit(`[${editPath}#${reading.tag}]\nreplace 1\n+ONE`),
+        (error: unknown) => {
+          assert.ok(error instanceof SnapshotRequiredError)
+          assert.match(error.message, /path spelling/i)
+          assert.equal(error.readHeader, reading.header)
+          assert.ok(error.message.split("\n").includes(reading.header))
+          assert.deepEqual(asRejected(error).written, [])
+          return true
+        },
+      )
+      assert.equal(await readFile(absolutePath, "utf8"), "one\ntwo\nthree\n")
+      await current.edit(`${reading.header}\nreplace 1\n+ONE`)
+      assert.equal(await readFile(absolutePath, "utf8"), "ONE\ntwo\nthree\n")
+      await writeFile(absolutePath, "one\ntwo\nthree\n")
+    }
+  }
+})
+
+test("path spelling diagnostics do not suggest stale or evicted snapshots", async () => {
+  const reading = await service.read(path.join(root, "a.ts"))
+  const patch = `[a.ts#${reading.tag}]\nreplace 1\n+ONE`
+  await writeFile(path.join(root, "a.ts"), "changed\n")
+  await assert.rejects(service.edit(patch), (error: unknown) => {
+    assert.ok(error instanceof SnapshotRequiredError)
+    assert.equal(error.readHeader, undefined)
+    assert.match(error.message, /read first/)
+    return true
+  })
+  await writeFile(path.join(root, "a.ts"), "one\ntwo\nthree\n")
+  service.store.clear()
+  await assert.rejects(service.edit(patch), (error: unknown) => {
+    assert.ok(error instanceof SnapshotRequiredError)
+    assert.equal(error.readHeader, undefined)
+    assert.match(error.message, /read first/)
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
+})
+
+test("path spelling diagnostics do not recover a different file from the tag", async () => {
+  const reading = await service.read(path.join(root, "a.ts"))
+  await writeFile(path.join(root, "b.ts"), "one\ntwo\nthree\n")
+  await assert.rejects(service.edit(`[b.ts#${reading.tag}]\nreplace 1\n+ONE`), (error: unknown) => {
+    assert.ok(error instanceof SnapshotRequiredError)
+    assert.equal(error.readHeader, undefined)
+    assert.match(error.message, /read first/)
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "b.ts"), "utf8"), "one\ntwo\nthree\n")
+})
+
+test("path spelling diagnostics do not suggest a header never returned by read", async () => {
+  const absolute = await service.read(path.join(root, "a.ts"))
+  await writeFile(path.join(root, "a.ts"), "changed\n")
+  const relative = await service.read("a.ts")
+  await assert.rejects(service.edit(`[./a.ts#${relative.tag}]\nreplace 1\n+ONE`), (error: unknown) => {
+    assert.ok(error instanceof SnapshotRequiredError)
+    assert.equal(error.readHeader, relative.header)
+    assert.notEqual(error.readHeader, absolute.header.replace(absolute.tag, relative.tag))
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "changed\n")
+})
+
 test("a section without a tag asks for read before edit", async () => {
   await assert.rejects(
     service.edit("[a.ts]\nreplace 1\n+ONE"),
@@ -379,6 +451,13 @@ test("a 4-hex tag collision is a mismatch instead of a version choice", async ()
     bom: false,
   })
 
+  await assert.rejects(service.edit(`[./a.ts#${reading.tag}]\nreplace 1\n+unsafe`), (error: unknown) => {
+    assert.ok(error instanceof SnapshotRequiredError)
+    assert.equal(error.readHeader, undefined)
+    assert.match(error.message, /read first/)
+    return true
+  })
+
   await assert.rejects(
     service.edit(`${reading.header}\nreplace 1\n+unsafe`),
     (error: unknown) => error instanceof MismatchError,
@@ -396,6 +475,13 @@ test("a Snapshot from another rootId cannot authorize an edit", async () => {
     seenLines: [1, 2, 3],
     lineEnding: "lf",
     bom: false,
+  })
+
+  await assert.rejects(service.edit(`[./a.ts#${reading.tag}]\nreplace 1\n+unsafe`), (error: unknown) => {
+    assert.ok(error instanceof SnapshotRequiredError)
+    assert.equal(error.readHeader, undefined)
+    assert.match(error.message, /read first/)
+    return true
   })
 
   await assert.rejects(
