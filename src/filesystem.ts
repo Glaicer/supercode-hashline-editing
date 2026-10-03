@@ -121,7 +121,7 @@ export class FileSystemAdapter {
     this.renameFile = renameOperation ?? rename
   }
 
-  async _snapshotRoots(): Promise<string[]> {
+  async snapshotRoots(): Promise<string[]> {
     if (!this._rootsPromise) {
       this._rootsPromise = Promise.all([this.root, ...this.extraRoots].map((candidate) => realpath(candidate)))
     }
@@ -129,7 +129,7 @@ export class FileSystemAdapter {
   }
 
   async _rootForLexicalPath(candidate: string): Promise<string | null> {
-    const roots = await this._snapshotRoots()
+    const roots = await this.snapshotRoots()
     return roots.find((root) => isInside(root, candidate)) ?? null
   }
 
@@ -151,7 +151,7 @@ export class FileSystemAdapter {
       throw error
     }
 
-    const roots = await this._snapshotRoots()
+    const roots = await this.snapshotRoots()
     const rootPath = roots.find((root) => isInside(root, canonicalPath))
     if (!rootPath) throw new PathBoundaryError()
 

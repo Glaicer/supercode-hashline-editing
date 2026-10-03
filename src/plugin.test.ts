@@ -469,19 +469,24 @@ test("directory and media reads pass the native result through without a tag", a
   assert.equal(harness.nativeCalls.length, 2)
 })
 
-test("outside-root directories and symlinks are refused before native read", async () => {
+test("outside-root directory and symlink reads pass through natively with a read-only note", async () => {
   await symlink(outside, path.join(root, "escape"))
   const harness = await createHarness({
     directory: root,
     nativeRead: { execute: async () => nativeListResult("outside") },
   })
   for (const target of [outside, path.join(root, "escape")]) {
-    await assert.rejects(
-      readTool(harness.tools).execute({ path: target }, CONTEXT),
-      (error: unknown) => error instanceof BoundaryError,
-    )
+    const result = await readTool(harness.tools).execute({ path: target }, CONTEXT)
+    const content = String(result.content)
+    assert.match(content, /^Read directory outside, entries 1-1\na\.ts\nNote: /)
+    assert.ok(content.includes(target))
+    assert.ok(content.includes(`roots: ${root}`))
+    assert.match(content, /hashline edit is unavailable/)
+    assert.doesNotMatch(content, /\[[^[\]]*#[0-9A-F]{4}\]/)
+    assert.deepEqual(result.metadata, { truncated: false })
+    assert.equal(result.output.type, "list-page")
   }
-  assert.equal(harness.nativeCalls.length, 0)
+  assert.equal(harness.nativeCalls.length, 2)
 })
 
 test("native read failures propagate unchanged", async () => {
@@ -826,21 +831,30 @@ test("edit preserves BOM and CRLF and writes a literal empty body line", async (
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "\uFEFFone\r\n\r\n")
 })
 
-test("text outside the Snapshot Root refuses instead of returning an untagged read", async () => {
+test("text outside the Snapshot Root passes through natively without a tag or Snapshot", async () => {
   const harness = await createHarness({
     directory: root,
     nativeRead: {
       execute: async (input) => nativeTextResult(String(input.path), "secret\n"),
     },
   })
+  const target = path.join(outside, "secret.ts")
 
-  await assert.rejects(
-    readTool(harness.tools).execute({ path: path.join(outside, "secret.ts") }, CONTEXT),
-    (error: unknown) => error instanceof BoundaryError,
-  )
+  const result = await readTool(harness.tools).execute({ path: target }, CONTEXT)
+  const lines = String(result.content).split("\n")
+  assert.equal(lines[0], `Read file ${target}, lines 1-1`)
+  assert.equal(lines[1], "1: secret")
+  assert.equal(lines.length, 3)
+  assert.match(lines[2], /Note: .* is outside the Snapshot Root/)
+  assert.ok(lines[2].includes(target))
+  assert.ok(lines[2].includes(`roots: ${root}`))
+  assert.match(lines[2], /hashline edit is unavailable/)
+  assert.doesNotMatch(String(result.content), /\[[^[\]]*#[0-9A-F]{4}\]/)
+  assert.deepEqual(result.metadata, { truncated: false })
+  assert.equal(harness.nativeCalls.length, 1)
 })
 
-test("relative escapes, absolute outside paths, and outward symlinks refuse read and edit without disclosure", async () => {
+test("relative escapes, absolute outside paths, and outward symlinks read natively but refuse edit", async () => {
   const link = path.join(root, "escape.ts")
   await symlink(path.join(outside, "secret.ts"), link)
   const harness = await createHarness({
@@ -850,20 +864,62 @@ test("relative escapes, absolute outside paths, and outward symlinks refuse read
   const tag = computeTag("secret\n")
   const targets = [path.relative(root, path.join(outside, "secret.ts")), path.join(outside, "secret.ts"), "escape.ts"]
   for (const target of targets) {
-    await assert.rejects(readTool(harness.tools).execute({ path: target }, CONTEXT), (error: unknown) => {
-      assert.ok(error instanceof BoundaryError)
-      assert.doesNotMatch(error.message, /File does not exist|secret\n/i)
-      return true
-    })
+    const reading = await readTool(harness.tools).execute({ path: target }, CONTEXT)
+    const content = String(reading.content)
+    assert.match(content, /1: secret/)
+    assert.doesNotMatch(content, /\[[^[\]]*#[0-9A-F]{4}\]/)
+    assert.match(content, /outside the Snapshot Root/)
+    assert.deepEqual(reading.metadata, { truncated: false })
     await assert.rejects(editTool(harness.tools).execute({ patch: `[${target}#${tag}]\nreplace 1\n+leak` }, CONTEXT), (error: unknown) => {
       assert.ok(error instanceof BoundaryError)
+      assert.ok(error.message.includes(`Path ${target} is outside the Snapshot Root`))
+      assert.ok(error.message.includes(`roots: ${root}`))
       assert.deepEqual((error as AnyRecord).written, [])
       assert.doesNotMatch(error.message, /File does not exist|secret\n/i)
       return true
     })
   }
-  assert.equal(harness.nativeCalls.length, 0)
+  assert.equal(harness.nativeCalls.length, targets.length)
   assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
+})
+
+test("media reads outside the root pass through with the note as a text part", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async () => nativeMediaResult("img.png") },
+  })
+  const target = path.join(outside, "img.png")
+
+  const result = await readTool(harness.tools).execute({ path: target }, CONTEXT)
+  const parts = result.content as AnyRecord[]
+  assert.equal(parts.length, 3)
+  assert.equal(parts[1].uri, "data:image/png;base64,cHJvYmU=")
+  assert.equal(parts[2].type, "text")
+  assert.ok(parts[2].text.includes(target))
+  assert.match(parts[2].text, /outside the Snapshot Root/)
+  assert.doesNotMatch(JSON.stringify(parts), /#[0-9A-F]{4}/)
+  assert.equal(result.output.type, "file")
+})
+
+test("an inside-root non-text read that escapes mid-flight is still refused", async () => {
+  const link = path.join(root, "escape")
+  await symlink(path.join(root, "a.ts"), link)
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: {
+      execute: async () => {
+        await rm(link)
+        await symlink(outside, link)
+        return nativeListResult("escape")
+      },
+    },
+  })
+
+  await assert.rejects(
+    readTool(harness.tools).execute({ path: "escape" }, CONTEXT),
+    (error: unknown) => error instanceof BoundaryError,
+  )
+  assert.equal(harness.nativeCalls.length, 1)
 })
 
 test("a symlink switched outside after read or before rename cannot write beyond the Snapshot Root", async () => {

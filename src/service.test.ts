@@ -390,6 +390,25 @@ test("boundary failures do not reveal or write files outside the root", async ()
   assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
 })
 
+test("boundary rejections name the requested path and the actual roots", async () => {
+  await assert.rejects(service.read(path.join(outside, "secret.ts")), (error: unknown) => {
+    assert.ok(error instanceof BoundaryError)
+    assert.ok(error.message.includes(`Path ${path.join(outside, "secret.ts")} is outside the Snapshot Root`))
+    assert.ok(error.message.includes(`roots: ${root}`))
+    assert.match(error.message, /hashline edit is unavailable/)
+    return true
+  })
+
+  await assert.rejects(service.edit("[../secret.ts#AAAA]\nreplace 1\n+leak"), (error: unknown) => {
+    assert.ok(error instanceof BoundaryError)
+    assert.ok(error.message.startsWith("Path ../secret.ts is outside the Snapshot Root"))
+    assert.ok(error.message.includes(`roots: ${root}`))
+    assert.deepEqual(asRejected(error).written, [])
+    return true
+  })
+  assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
+})
+
 test("retargeting a link between read and edit is rejected", async () => {
   const link = path.join(root, "link.ts")
   await symlink(path.join(root, "a.ts"), link)

@@ -6,9 +6,17 @@ export class HashlineError extends Error {
 }
 
 export class BoundaryError extends HashlineError {
-  constructor() {
-    super("Path is outside the Snapshot Root")
+  path?: string
+  roots?: string[]
+  constructor(path?: string, roots?: string[]) {
+    super(
+      path
+        ? `Path ${path} is outside the Snapshot Root${roots?.length ? ` (roots: ${roots.join(", ")})` : ""}; hashline edit is unavailable for ${path}`
+        : "Path is outside the Snapshot Root",
+    )
     this.name = "BoundaryError"
+    this.path = path
+    this.roots = roots
   }
 }
 
