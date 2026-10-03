@@ -1,6 +1,6 @@
 import { test, beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 
@@ -216,6 +216,7 @@ function nativeMediaResult(relPath: string): AnyRecord {
 
 interface HarnessInput {
   directory: string
+  projectDirectory?: string
   options?: unknown
   nativeRead?: NativeReadBehavior
   nativeWrite?: NativeWriteBehavior
@@ -232,7 +233,7 @@ interface Harness {
   replay: (withNative?: boolean) => Map<string, AnyRecord>
 }
 
-async function createHarness({ directory, options, nativeRead, nativeWrite, filesystem }: HarnessInput): Promise<Harness> {
+async function createHarness({ directory, projectDirectory, options, nativeRead, nativeWrite, filesystem }: HarnessInput): Promise<Harness> {
   const editor = createFakeEditor()
   const nativeCalls: Array<{ input: AnyRecord; context: ToolContextLike }> = []
   addFakeBuiltins(editor, directory, nativeWrite)
@@ -255,7 +256,7 @@ async function createHarness({ directory, options, nativeRead, nativeWrite, file
   const transforms: Array<(target: ReturnType<typeof createFakeEditor>) => void> = []
   let disposeCount = 0
   const ctx = {
-    location: { directory },
+    location: { directory, ...(projectDirectory ? { project: { directory: projectDirectory } } : {}) },
     options: options ?? {},
     tool: {
       transform: async (callback: (target: ReturnType<typeof createFakeEditor>) => void) => {
@@ -1012,6 +1013,123 @@ test("a symlink switched outside after read or before rename cannot write beyond
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
   assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
   assert.deepEqual((await readdir(root)).sort(), ["a.ts", "link.ts"])
+})
+
+test("a session booted in a subdirectory reads and edits files at the project root", async () => {
+  const subdir = path.join(root, "subdir")
+  await mkdir(subdir, { recursive: true })
+  const target = path.join(root, "top.ts")
+  await writeFile(target, "top\n")
+  const harness = await createHarness({
+    directory: subdir,
+    projectDirectory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "top\n") },
+  })
+
+  const reading = await readTool(harness.tools).execute({ path: target }, CONTEXT)
+  assert.ok(String(reading.content).startsWith(`[${target}#`))
+  assert.match(String(reading.content), /^1:top$/m)
+  const relative = await readTool(harness.tools).execute({ path: "../top.ts" }, CONTEXT)
+  assert.ok(String(relative.content).startsWith("[../top.ts#"))
+
+  await editTool(harness.tools).execute({ patch: `${reading.metadata.header}\nreplace 1\n+TOP` }, CONTEXT)
+  assert.equal(await readFile(target, "utf8"), "TOP\n")
+})
+
+test("a subdirectory session keeps the outside-root passthrough for paths beyond the project root", async () => {
+  const subdir = path.join(root, "subdir")
+  await mkdir(subdir, { recursive: true })
+  const target = path.join(outside, "secret.ts")
+  const harness = await createHarness({
+    directory: subdir,
+    projectDirectory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "secret\n") },
+  })
+
+  const reading = await readTool(harness.tools).execute({ path: target }, CONTEXT)
+  const note = String(reading.content).split("\n")[2]
+  assert.match(note, /Note: .* is outside the Snapshot Root/)
+  assert.ok(note.includes(target))
+  assert.ok(note.includes(`roots: ${root})`))
+  assert.match(note, /hashline edit is unavailable/)
+  assert.doesNotMatch(String(reading.content), /\[[^[]*#[0-9A-F]{4}\]/)
+  await assert.rejects(editTool(harness.tools).execute({ patch: `[${target}#${computeTag("secret\n")}]\nreplace 1\n+leak` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof BoundaryError)
+    assert.ok(error.message.includes(`Path ${target} is outside the Snapshot Root`))
+    assert.ok(error.message.includes(`roots: ${root})`))
+    return true
+  })
+})
+
+test("without location.project the boundary stays the boot directory", async () => {
+  const target = path.join(outside, "secret.ts")
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "secret\n") },
+  })
+
+  const reading = await readTool(harness.tools).execute({ path: target }, CONTEXT)
+  assert.ok(String(reading.content).includes(`roots: ${root}`))
+  assert.doesNotMatch(String(reading.content), /\[[^[]*#[0-9A-F]{4}\]/)
+  await assert.rejects(editTool(harness.tools).execute({ patch: `[${target}#${computeTag("secret\n")}]\nreplace 1\n+leak` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof BoundaryError)
+    assert.ok(error.message.includes(`roots: ${root}`))
+    return true
+  })
+})
+
+test("a project.directory equal to the boot directory keeps the boot-directory boundary", async () => {
+  const target = path.join(outside, "secret.ts")
+  const harness = await createHarness({
+    directory: root,
+    projectDirectory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "secret\n") },
+  })
+
+  const reading = await readTool(harness.tools).execute({ path: target }, CONTEXT)
+  assert.ok(String(reading.content).includes(`roots: ${root}`))
+  assert.doesNotMatch(String(reading.content), /\[[^[]*#[0-9A-F]{4}\]/)
+  await assert.rejects(editTool(harness.tools).execute({ patch: `[${target}#${computeTag("secret\n")}]\nreplace 1\n+leak` }, CONTEXT), (error: unknown) => {
+    assert.ok(error instanceof BoundaryError)
+    assert.ok(error.message.includes(`roots: ${root}`))
+    return true
+  })
+})
+
+test("a worktree session bounds the Snapshot Root at the worktree, not the main checkout", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "hashline-v2-wt-"))
+  try {
+    const worktree = path.join(parent, "wt")
+    const mainCheckout = path.join(parent, "main")
+    await mkdir(path.join(worktree, "subdir"), { recursive: true })
+    await mkdir(mainCheckout, { recursive: true })
+    await writeFile(path.join(worktree, "wt-root.ts"), "in-worktree\n")
+    await writeFile(path.join(mainCheckout, "main-only.ts"), "main-only\n")
+    const harness = await createHarness({
+      directory: path.join(worktree, "subdir"),
+      projectDirectory: worktree,
+      nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "text\n") },
+    })
+
+    const inside = await readTool(harness.tools).execute({ path: path.join(worktree, "wt-root.ts") }, CONTEXT)
+    assert.ok(String(inside.content).startsWith(`[${path.join(worktree, "wt-root.ts")}#`))
+
+    const outsidePath = path.join(mainCheckout, "main-only.ts")
+    const outsideRead = await readTool(harness.tools).execute({ path: outsidePath }, CONTEXT)
+    assert.ok(String(outsideRead.content).includes(`roots: ${worktree})`))
+    assert.doesNotMatch(String(outsideRead.content), /\[[^[]*#[0-9A-F]{4}\]/)
+    await assert.rejects(
+      editTool(harness.tools).execute({ patch: `[${outsidePath}#${computeTag("main-only\n")}]\nreplace 1\n+leak` }, CONTEXT),
+      (error: unknown) => {
+        assert.ok(error instanceof BoundaryError)
+        assert.ok(error.message.includes(`Path ${outsidePath} is outside the Snapshot Root`))
+        assert.ok(error.message.includes(`roots: ${worktree})`))
+        return true
+      },
+    )
+  } finally {
+    await rm(parent, { recursive: true, force: true })
+  }
 })
 
 test("window reads keep absolute line numbers and union SeenLines across reads", async () => {
