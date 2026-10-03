@@ -927,7 +927,7 @@ test("window reads keep absolute line numbers and union SeenLines across reads",
   })
 
   const first = await readTool(harness.tools).execute({ path: "a.ts", limit: 1 }, CONTEXT)
-  assert.match(first.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\n\[Output truncated\. Continue reading with offset: 2\]$/)
+  assert.match(first.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\nLines 1-1 shown; lines outside this range are NOT seen and cannot be edited until read\n\[Output truncated\. Continue reading with offset: 2\]$/)
   const tag = first.metadata.tag
 
   const second = await readTool(harness.tools).execute(
@@ -989,7 +989,7 @@ test("native byte-limited page bounds the tagged window and SeenLines", async ()
     },
   })
   const result = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
-  assert.match(result.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\n2:two\n\[Output truncated\. Continue reading with offset: 3\]$/)
+  assert.match(result.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\n2:two\nLines 1-2 shown; lines outside this range are NOT seen and cannot be edited until read\n\[Output truncated\. Continue reading with offset: 3\]$/)
   assert.deepEqual(result.metadata.seenLines, [1, 2])
   await assert.rejects(
     editTool(harness.tools).execute({ patch: `${result.metadata.header}\nreplace 3\n+THREE` }, CONTEXT),
@@ -1081,10 +1081,11 @@ test("reads are capped at 2000 lines with the native continuation footer", async
 
   const result = await readTool(harness.tools).execute({ path: "big.txt" }, CONTEXT)
   const lines = String(result.content).split("\n")
-  assert.equal(lines.length, 2002)
+  assert.equal(lines.length, 2003)
   assert.match(lines[1], /^1:line-1$/)
   assert.match(lines[2000], /^2000:line-2000$/)
-  assert.equal(lines[2001], "[Output truncated. Continue reading with offset: 2001]")
+  assert.equal(lines[2001], "Lines 1-2000 shown; lines outside this range are NOT seen and cannot be edited until read")
+  assert.equal(lines[2002], "[Output truncated. Continue reading with offset: 2001]")
 })
 
 test("plugin options apply: roots extend the Snapshot Root and the guard can be disabled", async () => {

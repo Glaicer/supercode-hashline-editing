@@ -25,6 +25,12 @@ const MAX_LINE_LENGTH = 2_000
 const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
 const TRUNCATION_FOOTER = (next: number) => `[Output truncated. Continue reading with offset: ${next}]`
 
+function visibilityNote(start: number, limit: number): string {
+  return limit > 0
+    ? `Lines ${start}-${start + limit - 1} shown; lines outside this range are NOT seen and cannot be edited until read`
+    : "No lines are shown; read the file to edit it"
+}
+
 const READ_DESCRIPTION = [
   "Read the contents of a file or directory.",
   "Text files are returned as a `[PATH#TAG]` header followed by the requested lines, each prefixed by its 1-based absolute line number as `N:TEXT`; the prefix is for reference and is not part of the file content.",
@@ -185,6 +191,7 @@ type ReadToolInput = { path: string; offset?: number; limit?: number }
 type EditToolInput = { patch: string }
 
 interface TextReadWindow {
+  readonly start: number
   readonly limit: number
   readonly truncated: boolean
   readonly next: number | undefined
@@ -204,13 +211,15 @@ function clampLineText(text: string): string {
 
 function nativeTextWindow(native: NativeToolResult, input: ReadToolInput): TextReadWindow {
   const output = native.output
-  if (!isRecord(output) || typeof output.content !== "string") return { limit: 0, truncated: false, next: undefined }
+  if (!isRecord(output) || typeof output.content !== "string") return { start: 1, limit: 0, truncated: false, next: undefined }
   const text = output.type === "file" ? output.content.replace(/\n$/, "") : output.content
   const emptyPage = output.type === "text-page" && output.content === "" && output.truncated !== true
   const lines = output.content === "" ? emptyPage ? [""] : [] : text.split("\n")
   const maximum = Math.min(input.limit || MAX_READ_LINES, MAX_READ_LINES, lines.length)
   const start = input.offset || 1
-  let budget = MAX_TAGGED_READ_BYTES - Buffer.byteLength(`[${input.path}#FFFF]\n${TRUNCATION_FOOTER(999999999)}\n`)
+  let budget = MAX_TAGGED_READ_BYTES - Buffer.byteLength(
+    `[${input.path}#FFFF]\n${visibilityNote(999999999, 999999999)}\n${TRUNCATION_FOOTER(999999999)}\n`,
+  )
   let limit = 0
   for (const line of lines.slice(0, maximum)) {
     const bytes = Buffer.byteLength(`${start + limit}:${clampLineText(line)}\n`)
@@ -219,7 +228,7 @@ function nativeTextWindow(native: NativeToolResult, input: ReadToolInput): TextR
     limit += 1
   }
   const next = limit < lines.length ? start + limit : typeof output.next === "number" ? output.next : undefined
-  return { limit, truncated: next !== undefined, next }
+  return { start, limit, truncated: next !== undefined, next }
 }
 
 function clampNumberedLine(line: string): string {
@@ -287,7 +296,7 @@ function makeReadTool({
       }
 
       const output = native.output
-      const { limit, truncated, next } = nativeTextWindow(native, input)
+      const { start, limit, truncated, next } = nativeTextWindow(native, input)
       let result: ReadResult
       try {
         result = await service.read(input.path, limit, input.offset, (line) => line.length <= MAX_LINE_LENGTH)
@@ -305,7 +314,7 @@ function makeReadTool({
       const lines = result.numbered === "" ? [] : result.numbered.split("\n").map(clampNumberedLine)
       const content =
         [result.header, ...lines].join("\n") +
-        (truncated && next !== undefined ? `\n${TRUNCATION_FOOTER(next)}` : "")
+        (truncated && next !== undefined ? `\n${visibilityNote(start, limit)}\n${TRUNCATION_FOOTER(next)}` : "")
       return { output, content, metadata: serializableReadMetadata(result) }
     },
   }
