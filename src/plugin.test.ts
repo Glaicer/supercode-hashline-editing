@@ -1013,6 +1013,7 @@ test("unseen Anchors reveal up to forty lines; truncated previews do not authori
       assert.equal(error.revealed.length, 40)
       assert.equal(error.revealed[0].text, "line-2")
       assert.equal(error.truncated, true)
+      assert.match(error.message, /Re-read the missing lines with offset 2 and retry/)
       assert.deepEqual((error as AnyRecord).written, [])
       return true
     })
@@ -1022,10 +1023,12 @@ test("unseen Anchors reveal up to forty lines; truncated previews do not authori
     assert.ok(error instanceof SeenLinesError)
     assert.deepEqual(error.revealed, [{ line: 2, text: "line-2" }])
     assert.equal(error.truncated, false)
+    assert.match(error.message, /The missing lines are shown above; retry the edit now with the same header — no re-read needed/)
     return true
   })
   await edit.execute({ patch: shortPatch }, CONTEXT)
   assert.equal((await readFile(path.join(root, "a.ts"), "utf8")).split("\n")[1], "TWO")
+  assert.equal(harness.nativeCalls.length, 1)
 })
 
 test("native NFC alternate path becomes the tagged editable path", async () => {
@@ -1131,7 +1134,7 @@ test("plugin options apply: roots extend the Snapshot Root and the guard can be 
       { patch: `${String(limited.content).split("\n")[0]}\nreplace 2\n+TWO` },
       CONTEXT,
     ),
-    /re-read the missing lines and retry/,
+    /retry the edit now with the same header/,
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
 })

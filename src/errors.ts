@@ -114,9 +114,9 @@ export class SeenLinesError extends HashlineError {
   constructor({ path, missingLines, revealed, truncated }: SeenLinesDetails) {
     const preview = revealed.map(({ line, text }) => `${line}:${text}`).join("\n")
     super(
-      `SeenLines guard rejected an edit for ${path}; re-read the missing lines and retry${
-        preview ? `\n${preview}` : ""
-      }`,
+      truncated
+        ? `SeenLines guard rejected an edit for ${path}\n${preview}\nRe-read the missing lines with offset ${missingLines[0]} and retry`
+        : `SeenLines guard rejected an edit for ${path}\n${preview}\nThe missing lines are shown above; retry the edit now with the same header — no re-read needed`,
     )
     this.name = "SeenLinesError"
     this.path = path
