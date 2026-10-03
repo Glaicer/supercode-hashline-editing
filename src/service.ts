@@ -131,8 +131,8 @@ function capabilityKey(inputPath: string, rootId: string): string {
   return `${rootId}\u0000${inputPath}`
 }
 
-function mapFilesystemError(error: unknown, operation: string, displayPath: string, expectedTag?: string): unknown {
-  if (error instanceof PathBoundaryError) return new BoundaryError()
+function mapFilesystemError(error: unknown, operation: string, displayPath: string, expectedTag?: string, roots?: string[]): unknown {
+  if (error instanceof PathBoundaryError) return new BoundaryError(displayPath, roots)
   if (error instanceof FileNotFoundError && operation === "edit") return new MissingFileError(displayPath)
   if (error instanceof LiveFileChangedError && expectedTag) {
     return new MismatchError({ path: displayPath, expectedTag, actualTag: computeTag(error.actualText) })
@@ -404,7 +404,7 @@ export class HashlineService {
     try {
       return await this.filesystem.read(inputPath, this.directory)
     } catch (error) {
-      throw mapFilesystemError(error, operation, inputPath)
+      throw mapFilesystemError(error, operation, inputPath, undefined, await this.filesystem.snapshotRoots())
     }
   }
 
@@ -577,7 +577,7 @@ export class HashlineService {
             }),
           )
         } catch (error) {
-          throw mapFilesystemError(error, "edit", plan.section.path, plan.section.tag)
+          throw mapFilesystemError(error, "edit", plan.section.path, plan.section.tag, await this.filesystem.snapshotRoots())
         }
       }
     } catch (error) {
@@ -597,7 +597,7 @@ export class HashlineService {
           const committed = await this.filesystem.commitPrepared(prepared[index])
           forward.push({ plan, committed })
         } catch (error) {
-          const mapped = mapFilesystemError(error, "edit", plan.section.path, plan.section.tag)
+          const mapped = mapFilesystemError(error, "edit", plan.section.path, plan.section.tag, await this.filesystem.snapshotRoots())
           if ((mapped as { committed?: unknown }).committed) {
             forward.push({ plan, committed: mapped as { persistedText?: string } })
           }

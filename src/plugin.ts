@@ -105,19 +105,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
 
-function readBoundary(directory: string, roots: string[]): (inputPath: string) => Promise<void> {
+function readBoundary(directory: string, roots: string[]): (inputPath: string) => Promise<boolean> {
   return async (inputPath) => {
     let candidate = path.resolve(directory, inputPath)
-    if (!roots.some((root) => isInside(root, candidate))) throw new BoundaryError()
+    if (!roots.some((root) => isInside(root, candidate))) return false
     while (true) {
       try {
         const actual = await realpath(candidate)
-        if (!roots.some((root) => isInside(root, actual))) throw new BoundaryError()
-        return
+        return roots.some((root) => isInside(root, actual))
       } catch (error) {
         if (!(error instanceof Error) || !["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error
         const parent = path.dirname(candidate)
-        if (parent === candidate) throw new BoundaryError()
+        if (parent === candidate) return false
         candidate = parent
       }
     }
@@ -253,6 +252,18 @@ function serializableReadMetadata(result: ReadResult) {
   }
 }
 
+function outsideRootNote(inputPath: string, roots: string[]): string {
+  return `Note: ${inputPath} is outside the Snapshot Root (roots: ${roots.join(", ")}); read natively without a Snapshot, so hashline edit is unavailable for this file.`
+}
+
+function withOutsideRootNote(native: NativeToolResult, inputPath: string, roots: string[]): NativeToolResult {
+  const note = outsideRootNote(inputPath, roots)
+  const content = native.content
+  if (typeof content === "string") return { ...native, content: content === "" ? note : `${content}\n${note}` }
+  if (Array.isArray(content)) return { ...native, content: [...content, { type: "text", text: note }] }
+  return { ...native, content: note }
+}
+
 function serializableEditMetadata(result: EditResult) {
   return {
     warnings: result.warnings,
@@ -276,11 +287,13 @@ function makeReadTool({
   service,
   nativeRead,
   assertBoundary,
+  roots,
   maxTaggedReadBytes,
 }: {
   service: HashlineService
   nativeRead: (Info & { readonly id: string }) | undefined
-  assertBoundary: (inputPath: string) => Promise<void>
+  assertBoundary: (inputPath: string) => Promise<boolean>
+  roots: string[]
   maxTaggedReadBytes: number
 }): Info {
   return {
@@ -295,10 +308,11 @@ function makeReadTool({
           "hashline read: the host read tool is unavailable, so hashline refuses to read without its native executor",
         )
       }
-      await assertBoundary(input.path)
+      const insideRoot = await assertBoundary(input.path)
       const native = (await nativeRead.execute(input, context)) as NativeToolResult
+      if (!insideRoot) return withOutsideRootNote(native, input.path, roots)
       if (!isNativeTextResult(native)) {
-        await assertBoundary(input.path)
+        if (!(await assertBoundary(input.path))) throw new BoundaryError(input.path, roots)
         return native
       }
 
@@ -406,7 +420,8 @@ function makeSurfaceHook(list: HashlinePluginInput["tool"]["list"]): (event: Sur
 export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem?: FileSystemAdapter): Promise<() => Promise<void>> {
   const directory = path.resolve(input.location.directory)
   const settings = resolveHashlineSettings(input.options, directory)
-  const assertBoundary = readBoundary(directory, await Promise.all([directory, ...settings.roots].map((root) => realpath(root))))
+  const roots = await Promise.all([directory, ...settings.roots].map((root) => realpath(root)))
+  const assertBoundary = readBoundary(directory, roots)
   const store = new InMemorySnapshotStore({
     maxPaths: settings.maxPaths,
     maxVersionsPerPath: settings.maxVersionsPerPath,
@@ -423,7 +438,7 @@ export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem
 
   const registration = await input.tool.transform((editor: ToolEditor) => {
     const nativeRead = editor.get(READ_NAME)
-    editor.add(makeReadTool({ service, nativeRead, assertBoundary, maxTaggedReadBytes: settings.maxTaggedReadBytes }))
+    editor.add(makeReadTool({ service, nativeRead, assertBoundary, roots, maxTaggedReadBytes: settings.maxTaggedReadBytes }))
     editor.add(makeEditTool({ service }))
     const nativeWrite = editor.get(WRITE_NAME)
     if (nativeWrite) editor.add(makeWriteTool({ service, nativeWrite }))

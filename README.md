@@ -57,6 +57,19 @@ v1 reads the same values from a `hashline` section of the config.
 | `maxTotalBytes` | `67108864` | total snapshot budget in bytes |
 | `maxTaggedReadBytes` | `40960` | byte budget of one tagged text read before truncation |
 
+`roots` takes absolute paths (or paths relative to the project root). Files outside the Snapshot Root can still be `read` natively, but `edit` stays unavailable there — to hashline-edit dotfiles outside the project, add their directory:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "@glaicer/supercode-hashline-editing",
+      "options": { "roots": ["/home/me/.config/opencode"] }
+    }
+  ]
+}
+```
+
 ## Warning: edit permissions are not enforced
 
 Hashline `edit` writes directly — the plugin API has no way to ask OpenCode for approval at write time. `edit: ask` rules won't prompt, and path-scoped `edit: deny` rules won't block it (measured on OpenCode 2.0.18). Only a blanket `edit: deny *` stops it, and only because the tool is then hidden from the model entirely. Reads are unaffected — they go through the native read tool and honor `read` permissions.
