@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@glaicer/supercode-hashline-editing",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "OpenCode V2 plugin for capability-bound hashline read/edit operations",
   "type": "module",
   "license": "MIT",
@@ -44,9 +44,9 @@
     "test": "node --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },
-  "//": "Pins verified 2026-09-29 against registry.npmjs.org and host 2.0.18: @opencode/plugin must equal the host version and declares effect 4.0.0-rc.112 itself (npm view @opencode/plugin@2.0.18 dependencies), so both stay exact here.",
+  "//": "Pins verified 2026-10-03 against registry.npmjs.org and host 2.0.22: @opencode/plugin must equal the host version and declares effect 4.0.0-rc.112 itself (npm view @opencode/plugin@2.0.22 dependencies), so both stay exact here.",
   "dependencies": {
-    "@opencode/plugin": "2.0.18",
+    "@opencode/plugin": "2.0.22",
     "effect": "4.0.0-rc.112"
   },
   "devDependencies": {
