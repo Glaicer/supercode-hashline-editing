@@ -120,36 +120,40 @@ function parseHunkHeader(line: string, lineNumber: number, warnings: string[]): 
 
   if (APPEND_RE.test(corrected)) return { operation: "insert", placement: "append" }
 
-  if (/^PUT(?:\s|$)/.test(line)) {
-    unsupportedOperation(line, lineNumber, "PUT", "Oh My Pi syntax not supported; see the edit tool description")
+  // Detectors see the corrected form so a leaked body-row '+' (e.g. `+PUT 3`) still
+  // surfaces the specific unsupported-op message; correction itself stays limited to
+  // unambiguous hunk-header forms.
+  const detected = corrected.startsWith("+") ? corrected.slice(1) : corrected
+  if (/^PUT(?:\s|$)/.test(detected)) {
+    unsupportedOperation(detected, lineNumber, "PUT", "Oh My Pi syntax not supported; see the edit tool description")
   }
-  if (/\.=/.test(line)) {
-    unsupportedOperation(line, lineNumber, ".=", "Oh My Pi syntax not supported; see the edit tool description")
+  if (/\.=/.test(detected)) {
+    unsupportedOperation(detected, lineNumber, ".=", "Oh My Pi syntax not supported; see the edit tool description")
   }
-  if (/^CUT(?:\s|$)/.test(line)) {
-    unsupportedOperation(line, lineNumber, "CUT", "clipboard not supported")
+  if (/^CUT(?:\s|$)/.test(detected)) {
+    unsupportedOperation(detected, lineNumber, "CUT", "clipboard not supported")
   }
-  if (/^REM(?:\s|$)/.test(line)) {
+  if (/^REM(?:\s|$)/.test(detected)) {
     unsupportedOperation(
-      line,
+      detected,
       lineNumber,
       "REM",
       "deletion and movement are not part of v1; use guarded_bash",
     )
   }
-  if (/^MV(?:\s|$)/.test(line)) {
+  if (/^MV(?:\s|$)/.test(detected)) {
     unsupportedOperation(
-      line,
+      detected,
       lineNumber,
       "MV",
       "deletion and movement are not part of v1; use guarded_bash",
     )
   }
-  if (/^@/.test(line)) {
-    unsupportedOperation(line, lineNumber, line, "clipboard not supported")
+  if (/^@/.test(detected)) {
+    unsupportedOperation(detected, lineNumber, detected, "clipboard not supported")
   }
-  if (/^(?:replace\s+)?[1-9]\d*\*\s*$/.test(line) || /^N\*\s*$/.test(line)) {
-    unsupportedOperation(line, lineNumber, "N*", "block ops not supported; use replace N-M")
+  if (/^(?:replace\s+)?[1-9]\d*\*\s*$/.test(detected) || /^N\*\s*$/.test(detected)) {
+    unsupportedOperation(detected, lineNumber, "N*", "block ops not supported; use replace N-M")
   }
 
   throw new PatchSyntaxError(

@@ -8,7 +8,7 @@ import { Schema } from "effect"
 import { resolveHashlineSettings, setupHashlinePlugin } from "./plugin.ts"
 import { computeTag } from "./hash.ts"
 import { BoundaryError, DuplicatePathError, MismatchError, NoChangesError, SeenLinesError, SnapshotRequiredError } from "./errors.ts"
-import { FileSystemAdapter } from "./filesystem.ts"
+import { FileNotFoundError, FileSystemAdapter } from "./filesystem.ts"
 import { PatchSyntaxError } from "./parser.ts"
 
 type AnyRecord = Record<string, any>
@@ -1670,4 +1670,18 @@ test("a write outside the Snapshot Root returns the native result unchanged and 
     editTool(harness.tools).execute({ patch: `[${outsidePath}#AAAA]\nreplace 1\n+X` }, CONTEXT),
     (error: unknown) => error instanceof BoundaryError,
   )
+})
+
+test("a failed registration read-back degrades to the native write result without a header", async () => {
+  const harness = await createHarness({
+    directory: root,
+    filesystem: new class extends FileSystemAdapter {
+      override async read(): Promise<never> {
+        throw new FileNotFoundError("a.ts")
+      }
+    }({ root }),
+  })
+  const result = await writeTool(harness.tools).execute({ path: "a.ts", content: "one\ntwo\n" }, CONTEXT)
+  assert.deepEqual(result, { content: "written" })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
 })
