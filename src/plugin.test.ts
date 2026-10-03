@@ -348,6 +348,41 @@ test("tool descriptions require verbatim headers and discourage bypassing reject
   }
 })
 
+test("edit content leads with warning lines for tolerated patch fixes", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+  const read = readTool(harness.tools)
+  const edit = editTool(harness.tools)
+
+  const reading = await read.execute({ path: "a.ts" }, CONTEXT)
+  const fixed = await edit.execute(
+    { patch: `${reading.metadata.header}\n+replace 1\n+ONE` },
+    CONTEXT,
+  )
+  assert.match(String(fixed.content), /^warning: line 2: removed the leading '\+'/)
+  assert.equal(fixed.metadata.warnings.length, 1)
+  assert.match(String(fixed.content), /\[a\.ts#[0-9A-F]{4}\]\nfirstChangedLine: 1/)
+
+  const clean = await edit.execute(
+    { patch: `${fixed.metadata.sections[0].header}\nreplace 1\n+one` },
+    CONTEXT,
+  )
+  assert.doesNotMatch(String(clean.content), /^warning:/m)
+  assert.deepEqual(clean.metadata.warnings, [])
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+})
+
+test("the edit description teaches hunk grammar and the +- escape counterexample", async () => {
+  const harness = await createHarness({ directory: root })
+  const description = editTool(harness.tools).description
+
+  assert.match(description, /never start with `\+`/)
+  assert.match(description, /`\+import`, NOT `\+-import`/)
+  assert.match(description, /Example patch:\n\[src\/a\.ts#A1B2\]\nreplace 3\n\+const x = 1$/)
+})
+
 test("absolute reads recover from relative patch headers without rewriting the file", async () => {
   const absolutePath = path.join(root, "a.ts")
   const harness = await createHarness({
