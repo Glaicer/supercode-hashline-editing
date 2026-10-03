@@ -171,7 +171,10 @@ export interface HashlineToolEntry extends SurfaceToolEntry {
 }
 
 export interface HashlinePluginInput {
-  readonly location: { readonly directory: string }
+  readonly location: {
+    readonly directory: string
+    readonly project?: { readonly directory: string }
+  }
   readonly options: unknown
   readonly tool: {
     readonly transform: (
@@ -419,8 +422,9 @@ function makeSurfaceHook(list: HashlinePluginInput["tool"]["list"]): (event: Sur
 
 export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem?: FileSystemAdapter): Promise<() => Promise<void>> {
   const directory = path.resolve(input.location.directory)
+  const projectDirectory = path.resolve(input.location.project?.directory ?? input.location.directory)
   const settings = resolveHashlineSettings(input.options, directory)
-  const roots = await Promise.all([directory, ...settings.roots].map((root) => realpath(root)))
+  const roots = await Promise.all([projectDirectory, ...settings.roots].map((root) => realpath(root)))
   const assertBoundary = readBoundary(directory, roots)
   const store = new InMemorySnapshotStore({
     maxPaths: settings.maxPaths,
@@ -428,7 +432,7 @@ export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem
     maxTotalBytes: settings.maxTotalBytes,
   })
   const service = new HashlineService({
-    worktree: directory,
+    worktree: projectDirectory,
     directory,
     roots: settings.roots,
     filesystem,
