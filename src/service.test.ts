@@ -263,6 +263,16 @@ test("multi-section preflight rejects duplicate canonical paths", async () => {
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
 })
 
+test("tolerated hunk fixes surface as warnings on the edit result", async () => {
+  const reading = await service.read("a.ts")
+
+  const result = await service.edit([reading.header, "+replace 1", "+ONE"].join("\n"))
+
+  assert.equal(result.sections[0].after, "ONE\ntwo\nthree\n")
+  assert.equal(result.warnings.length, 1)
+  assert.match(result.warnings[0], /removed the leading '\+' from the hunk header "\+replace 1"/)
+})
+
 test("syntax failures still carry an empty commit report", async () => {
   await assert.rejects(
     service.edit("not a hashline patch"),

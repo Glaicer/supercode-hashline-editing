@@ -28,29 +28,25 @@ const TRUNCATION_FOOTER = (next: number) => `[Output truncated. Continue reading
 const READ_DESCRIPTION = [
   "Read the contents of a file or directory.",
   "Text files are returned as a `[PATH#TAG]` header followed by the requested lines, each prefixed by its 1-based absolute line number as `N:TEXT`; the prefix is for reference and is not part of the file content.",
-  "Copy the entire `[PATH#TAG]` header from this output verbatim into edit; both PATH and TAG must remain exactly as returned.",
-  "Never shorten an absolute path, normalize PATH, or reconstruct the header.",
+  "Copy the entire `[PATH#TAG]` header from this output verbatim into edit; both PATH and TAG must remain exactly as returned. Never shorten an absolute path, normalize PATH, or reconstruct the header.",
   "Partial reads register valid Snapshots; only the displayed lines are marked as seen.",
   "Images and PDFs are presented directly to the model. Directory entries are returned one per line.",
-  "Use offset and limit to read large files or directories in sections.",
-  "Prefer one larger read over many small slices, and use grep to find specific content in large files.",
-  "Hashline edits only existing files; use the native write tool to create files.",
-  "For existing files, use hashline edit. If edit rejects a patch, correct it using the diagnostic. Do not bypass a rejected edit with whole-file write or shell modification.",
+  "Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+  "Hashline edits only existing files; use the native write tool to create files. If edit rejects a patch, correct it using the diagnostic. Do not bypass a rejected edit with whole-file write or shell modification.",
   "Hashline never formats or restyles code.",
 ].join(" ")
 
 const EDIT_DESCRIPTION = [
   "Apply a hashline patch to existing files.",
-  "Each section starts with the entire `[PATH#TAG]` header copied from hashline read verbatim; both PATH and TAG must remain exactly as returned.",
-  "Never shorten an absolute path, normalize PATH, or reconstruct the header.",
-  "Partial reads register valid Snapshots; only the displayed lines are marked as seen.",
-  "A patch may contain multiple sections, with one section per file and multiple hunks inside a section.",
-  "Supported hunks are `replace N-M`, `replace N`, `insert before N`, `insert after N`, and `append`.",
-  "Every body row starts with `+TEXT`; a single `+` means an empty line, `+- item` writes a literal `- item`, and `++ item` writes a literal `+ item`.",
+  "Each section starts with the entire `[PATH#TAG]` header copied from hashline read verbatim; both PATH and TAG must remain exactly as returned. Never shorten an absolute path, normalize PATH, or reconstruct the header.",
+  "A patch may contain multiple sections, with one section per file and multiple hunks inside a section. Partial reads register valid Snapshots; only the displayed lines are marked as seen.",
+  "Hunk lines (`replace N-M`, `replace N`, `insert before N`, `insert after N`, `append`) never start with `+`.",
+  "Every body row starts with `+TEXT`; a single `+` means an empty line. `+-` and `++` exist only to write literal lines that start with `-` or `+`: to write a line starting with `import`, write `+import`, NOT `+-import`.",
   "Line numbers are from the original Snapshot, so hunks do not shift each other's addresses.",
   "Do not send `-old` deletion rows or context lines: send only the operation and replacement body.",
   "Hashline edits only existing files. NEVER format/restyle code; make only the requested exact changes.",
   "If edit rejects a patch, correct it using the diagnostic. Do not bypass a rejected edit with whole-file write or shell modification; use native write only to create files.",
+  "Example patch:\n[src/a.ts#A1B2]\nreplace 3\n+const x = 1",
 ].join(" ")
 
 const READ_INPUT_FALLBACK = {
@@ -242,6 +238,7 @@ function serializableReadMetadata(result: ReadResult) {
 
 function serializableEditMetadata(result: EditResult) {
   return {
+    warnings: result.warnings,
     sections: result.sections.map((section) => ({
       path: section.path,
       canonicalPath: section.canonicalPath,
@@ -319,9 +316,10 @@ function makeEditTool({ service }: { service: HashlineService }): Info {
     input: EDIT_INPUT,
     async execute(input: EditToolInput, _context: ToolContext) {
       const result = await service.edit(input.patch)
-      const content = result.sections
-        .map((section) => `${section.header}\nfirstChangedLine: ${section.firstChangedLine}`)
-        .join("\n")
+      const content = [
+        ...result.warnings.map((warning) => `warning: ${warning}`),
+        ...result.sections.map((section) => `${section.header}\nfirstChangedLine: ${section.firstChangedLine}`),
+      ].join("\n")
       return { content, metadata: serializableEditMetadata(result) }
     },
   }
