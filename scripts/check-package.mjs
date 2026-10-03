@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os"
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,6 +11,24 @@ const manifest = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"))
 assert.equal(manifest.exports?.["."], "./dist/index.js", "root export must be the V2 entry");
 assert.equal(manifest.main, "./dist/index.js", "main must be the V2 entry");
 assert.equal(manifest.engines?.opencode, ">=2.0.0", "package must declare V2 hosts only");
+
+function hostVersion() {
+  for (const bin of ["opencode", `${homedir()}/.opencode/bin/opencode`]) {
+    try {
+      return /v?(\d+\.\d+\.\d+)/.exec(execFileSync(bin, ["--version"], { encoding: "utf8" }))?.[1];
+    } catch {}
+  }
+  return undefined;
+}
+
+const host = hostVersion();
+assert.ok(host, "opencode host must be installed to verify the plugin pin");
+const hostPin = manifest.dependencies?.["@opencode/plugin"];
+assert.equal(
+  hostPin,
+  host,
+  `@opencode/plugin pin ${hostPin} must equal the running host ${host}; bump the pin and re-verify per the "Pins verified" note in package.json`,
+);
 
 const compiled = [
   "./dist/index.js",
