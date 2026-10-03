@@ -62,6 +62,7 @@ export interface SectionResult {
 
 export interface EditResult {
   sections: SectionResult[]
+  warnings: string[]
   written: string[]
   rolledBack: string[]
   partiallyWritten: string[]
@@ -523,7 +524,7 @@ export class HashlineService {
     return cleanupErrors
   }
 
-  async _commitPlans(plans: PreparedPlan[]): Promise<EditResult> {
+  async _commitPlans(plans: PreparedPlan[], warnings: string[]): Promise<EditResult> {
     const paths = plans.map((plan) => plan.file.canonicalPath)
     const prepared: PreparedAtomic[] = []
 
@@ -645,6 +646,7 @@ export class HashlineService {
       }
       return {
         sections: sectionResults,
+        warnings,
         written: [...paths],
         rolledBack: [],
         partiallyWritten: [],
@@ -683,7 +685,7 @@ export class HashlineService {
       }
 
       const plans = resolved.map(({ section, file }) => this._prepareSection(section, file))
-      return await this._commitPlans(plans)
+      return await this._commitPlans(plans, parsed.warnings)
     } catch (error) {
       if ((error as { report?: unknown }).report) throw error
       const reportPaths = uniquePaths([
