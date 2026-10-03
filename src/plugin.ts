@@ -4,7 +4,7 @@ import { realpath } from "node:fs/promises"
 
 import { Schema } from "effect"
 import { HashlineService } from "./service.ts"
-import type { EditResult, ReadResult } from "./service.ts"
+import type { EditResult, ReadResult, WrittenRegistration } from "./service.ts"
 import { InMemorySnapshotStore, SnapshotStoreLimits } from "./snapshots.ts"
 import { FileNotFoundError, isInside } from "./filesystem.ts"
 import type { FileSystemAdapter } from "./filesystem.ts"
@@ -25,32 +25,37 @@ const MAX_LINE_LENGTH = 2_000
 const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
 const TRUNCATION_FOOTER = (next: number) => `[Output truncated. Continue reading with offset: ${next}]`
 
+function visibilityNote(start: number, limit: number): string {
+  return limit > 0
+    ? `Lines ${start}-${start + limit - 1} shown; lines outside this range are NOT seen and cannot be edited until read`
+    : "No lines are shown; read the file to edit it"
+}
+
+// Upper bound reserved from the read budget so note+footer always fit, whatever the window shows.
+const WORST_CASE_VISIBILITY_NOTE = visibilityNote(999999999, 999999999)
+
 const READ_DESCRIPTION = [
   "Read the contents of a file or directory.",
   "Text files are returned as a `[PATH#TAG]` header followed by the requested lines, each prefixed by its 1-based absolute line number as `N:TEXT`; the prefix is for reference and is not part of the file content.",
-  "Copy the entire `[PATH#TAG]` header from this output verbatim into edit; both PATH and TAG must remain exactly as returned.",
-  "Never shorten an absolute path, normalize PATH, or reconstruct the header.",
+  "Copy the entire `[PATH#TAG]` header from this output verbatim into edit; both PATH and TAG must remain exactly as returned. Never shorten an absolute path, normalize PATH, or reconstruct the header.",
   "Partial reads register valid Snapshots; only the displayed lines are marked as seen.",
   "Images and PDFs are presented directly to the model. Directory entries are returned one per line.",
-  "Use offset and limit to read large files or directories in sections.",
-  "Prefer one larger read over many small slices, and use grep to find specific content in large files.",
-  "Hashline edits only existing files; use the native write tool to create files.",
-  "For existing files, use hashline edit. If edit rejects a patch, correct it using the diagnostic. Do not bypass a rejected edit with whole-file write or shell modification.",
+  "Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+  "Hashline edits only existing files; use the native write tool to create files. If edit rejects a patch, correct it using the diagnostic. Do not bypass a rejected edit with whole-file write or shell modification.",
   "Hashline never formats or restyles code.",
 ].join(" ")
 
 const EDIT_DESCRIPTION = [
   "Apply a hashline patch to existing files.",
-  "Each section starts with the entire `[PATH#TAG]` header copied from hashline read verbatim; both PATH and TAG must remain exactly as returned.",
-  "Never shorten an absolute path, normalize PATH, or reconstruct the header.",
-  "Partial reads register valid Snapshots; only the displayed lines are marked as seen.",
-  "A patch may contain multiple sections, with one section per file and multiple hunks inside a section.",
-  "Supported hunks are `replace N-M`, `replace N`, `insert before N`, `insert after N`, and `append`.",
-  "Every body row starts with `+TEXT`; a single `+` means an empty line, `+- item` writes a literal `- item`, and `++ item` writes a literal `+ item`.",
+  "Each section starts with the entire `[PATH#TAG]` header copied from hashline read verbatim; both PATH and TAG must remain exactly as returned. Never shorten an absolute path, normalize PATH, or reconstruct the header.",
+  "A patch may contain multiple sections, with one section per file and multiple hunks inside a section. Partial reads register valid Snapshots; only the displayed lines are marked as seen.",
+  "Hunk lines (`replace N-M`, `replace N`, `insert before N`, `insert after N`, `append`) never start with `+`.",
+  "Every body row starts with `+TEXT`; a single `+` means an empty line. `+-` and `++` exist only to write literal lines that start with `-` or `+`: to write a line starting with `import`, write `+import`, NOT `+-import`.",
   "Line numbers are from the original Snapshot, so hunks do not shift each other's addresses.",
   "Do not send `-old` deletion rows or context lines: send only the operation and replacement body.",
   "Hashline edits only existing files. NEVER format/restyle code; make only the requested exact changes.",
   "If edit rejects a patch, correct it using the diagnostic. Do not bypass a rejected edit with whole-file write or shell modification; use native write only to create files.",
+  "Example patch:\n[src/a.ts#A1B2]\nreplace 3\n+const x = 1",
 ].join(" ")
 
 const READ_INPUT_FALLBACK = {
@@ -87,6 +92,7 @@ export interface HashlinePluginSettings {
   maxPaths: number
   maxVersionsPerPath: number
   maxTotalBytes: number
+  maxTaggedReadBytes: number
 }
 
 const DEFAULT_SETTINGS: HashlinePluginSettings = Object.freeze({
@@ -95,25 +101,25 @@ const DEFAULT_SETTINGS: HashlinePluginSettings = Object.freeze({
   maxPaths: SnapshotStoreLimits.maxPaths,
   maxVersionsPerPath: SnapshotStoreLimits.maxVersionsPerPath,
   maxTotalBytes: SnapshotStoreLimits.maxTotalBytes,
+  maxTaggedReadBytes: MAX_TAGGED_READ_BYTES,
 })
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
 
-function readBoundary(directory: string, roots: string[]): (inputPath: string) => Promise<void> {
+function readBoundary(directory: string, roots: string[]): (inputPath: string) => Promise<boolean> {
   return async (inputPath) => {
     let candidate = path.resolve(directory, inputPath)
-    if (!roots.some((root) => isInside(root, candidate))) throw new BoundaryError()
+    if (!roots.some((root) => isInside(root, candidate))) return false
     while (true) {
       try {
         const actual = await realpath(candidate)
-        if (!roots.some((root) => isInside(root, actual))) throw new BoundaryError()
-        return
+        return roots.some((root) => isInside(root, actual))
       } catch (error) {
         if (!(error instanceof Error) || !["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error
         const parent = path.dirname(candidate)
-        if (parent === candidate) throw new BoundaryError()
+        if (parent === candidate) return false
         candidate = parent
       }
     }
@@ -133,8 +139,12 @@ function resolveConfiguredRoots(roots: unknown, directory: string): string[] {
 
 export function resolveHashlineSettings(raw: unknown, directory: string): HashlinePluginSettings {
   const options = isRecord(raw) ? raw : {}
-  const numberOr = (key: "maxPaths" | "maxVersionsPerPath" | "maxTotalBytes"): number =>
+  const numberOr = (key: "maxPaths" | "maxVersionsPerPath" | "maxTotalBytes" | "maxTaggedReadBytes"): number =>
     typeof options[key] === "number" ? (options[key] as number) : DEFAULT_SETTINGS[key]
+  const maxTaggedReadBytes = numberOr("maxTaggedReadBytes")
+  if (!Number.isFinite(maxTaggedReadBytes) || maxTaggedReadBytes <= 0) {
+    throw new TypeError("hashline maxTaggedReadBytes must be a positive number")
+  }
   return {
     enforceSeenLines:
       typeof options.enforceSeenLines === "boolean"
@@ -144,6 +154,7 @@ export function resolveHashlineSettings(raw: unknown, directory: string): Hashli
     maxPaths: numberOr("maxPaths"),
     maxVersionsPerPath: numberOr("maxVersionsPerPath"),
     maxTotalBytes: numberOr("maxTotalBytes"),
+    maxTaggedReadBytes,
   }
 }
 
@@ -163,7 +174,10 @@ export interface HashlineToolEntry extends SurfaceToolEntry {
 }
 
 export interface HashlinePluginInput {
-  readonly location: { readonly directory: string }
+  readonly location: {
+    readonly directory: string
+    readonly project?: { readonly directory: string }
+  }
   readonly options: unknown
   readonly tool: {
     readonly transform: (
@@ -183,8 +197,10 @@ type NativeToolResult = Result
 
 type ReadToolInput = { path: string; offset?: number; limit?: number }
 type EditToolInput = { patch: string }
+type WriteToolInput = { path: string; content: string }
 
 interface TextReadWindow {
+  readonly start: number
   readonly limit: number
   readonly truncated: boolean
   readonly next: number | undefined
@@ -202,15 +218,17 @@ function clampLineText(text: string): string {
   return text.length > MAX_LINE_LENGTH ? text.slice(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : text
 }
 
-function nativeTextWindow(native: NativeToolResult, input: ReadToolInput): TextReadWindow {
+function nativeTextWindow(native: NativeToolResult, input: ReadToolInput, maxTaggedReadBytes: number): TextReadWindow {
   const output = native.output
-  if (!isRecord(output) || typeof output.content !== "string") return { limit: 0, truncated: false, next: undefined }
+  if (!isRecord(output) || typeof output.content !== "string") return { start: 1, limit: 0, truncated: false, next: undefined }
   const text = output.type === "file" ? output.content.replace(/\n$/, "") : output.content
   const emptyPage = output.type === "text-page" && output.content === "" && output.truncated !== true
   const lines = output.content === "" ? emptyPage ? [""] : [] : text.split("\n")
   const maximum = Math.min(input.limit || MAX_READ_LINES, MAX_READ_LINES, lines.length)
   const start = input.offset || 1
-  let budget = MAX_TAGGED_READ_BYTES - Buffer.byteLength(`[${input.path}#FFFF]\n${TRUNCATION_FOOTER(999999999)}\n`)
+  let budget = maxTaggedReadBytes - Buffer.byteLength(
+    `[${input.path}#FFFF]\n${WORST_CASE_VISIBILITY_NOTE}\n${TRUNCATION_FOOTER(999999999)}\n`,
+  )
   let limit = 0
   for (const line of lines.slice(0, maximum)) {
     const bytes = Buffer.byteLength(`${start + limit}:${clampLineText(line)}\n`)
@@ -219,7 +237,7 @@ function nativeTextWindow(native: NativeToolResult, input: ReadToolInput): TextR
     limit += 1
   }
   const next = limit < lines.length ? start + limit : typeof output.next === "number" ? output.next : undefined
-  return { limit, truncated: next !== undefined, next }
+  return { start, limit, truncated: next !== undefined, next }
 }
 
 function clampNumberedLine(line: string): string {
@@ -240,8 +258,21 @@ function serializableReadMetadata(result: ReadResult) {
   }
 }
 
+function outsideRootNote(inputPath: string, roots: string[]): string {
+  return `Note: ${inputPath} is outside the Snapshot Root (roots: ${roots.join(", ")}); read natively without a Snapshot, so hashline edit is unavailable for this file.`
+}
+
+function withOutsideRootNote(native: NativeToolResult, inputPath: string, roots: string[]): NativeToolResult {
+  const note = outsideRootNote(inputPath, roots)
+  const content = native.content
+  if (typeof content === "string") return { ...native, content: content === "" ? note : `${content}\n${note}` }
+  if (Array.isArray(content)) return { ...native, content: [...content, { type: "text", text: note }] }
+  return { ...native, content: note }
+}
+
 function serializableEditMetadata(result: EditResult) {
   return {
+    warnings: result.warnings,
     sections: result.sections.map((section) => ({
       path: section.path,
       canonicalPath: section.canonicalPath,
@@ -261,11 +292,15 @@ function serializableEditMetadata(result: EditResult) {
 function makeReadTool({
   service,
   nativeRead,
-  assertBoundary,
+  withinRoot,
+  roots,
+  maxTaggedReadBytes,
 }: {
   service: HashlineService
   nativeRead: (Info & { readonly id: string }) | undefined
-  assertBoundary: (inputPath: string) => Promise<void>
+  withinRoot: (inputPath: string) => Promise<boolean>
+  roots: string[]
+  maxTaggedReadBytes: number
 }): Info {
   return {
     name: READ_NAME,
@@ -279,15 +314,16 @@ function makeReadTool({
           "hashline read: the host read tool is unavailable, so hashline refuses to read without its native executor",
         )
       }
-      await assertBoundary(input.path)
+      const insideRoot = await withinRoot(input.path)
       const native = (await nativeRead.execute(input, context)) as NativeToolResult
+      if (!insideRoot) return withOutsideRootNote(native, input.path, roots)
       if (!isNativeTextResult(native)) {
-        await assertBoundary(input.path)
+        if (!(await withinRoot(input.path))) throw new BoundaryError(input.path, roots)
         return native
       }
 
       const output = native.output
-      const { limit, truncated, next } = nativeTextWindow(native, input)
+      const { start, limit, truncated, next } = nativeTextWindow(native, input, maxTaggedReadBytes)
       let result: ReadResult
       try {
         result = await service.read(input.path, limit, input.offset, (line) => line.length <= MAX_LINE_LENGTH)
@@ -305,8 +341,53 @@ function makeReadTool({
       const lines = result.numbered === "" ? [] : result.numbered.split("\n").map(clampNumberedLine)
       const content =
         [result.header, ...lines].join("\n") +
-        (truncated && next !== undefined ? `\n${TRUNCATION_FOOTER(next)}` : "")
+        (truncated && next !== undefined ? `\n${visibilityNote(start, limit)}\n${TRUNCATION_FOOTER(next)}` : "")
       return { output, content, metadata: serializableReadMetadata(result) }
+    },
+  }
+}
+
+function serializableWriteMetadata(registration: WrittenRegistration) {
+  return {
+    path: registration.path,
+    canonicalPath: registration.canonicalPath,
+    tag: registration.tag,
+    header: registration.header,
+  }
+}
+
+function makeWriteTool({
+  service,
+  nativeWrite,
+}: {
+  service: HashlineService
+  nativeWrite: Info & { readonly id: string }
+}): Info {
+  return {
+    name: WRITE_NAME,
+    ...(nativeWrite.options ? { options: nativeWrite.options } : {}),
+    description: nativeWrite.description,
+    input: nativeWrite.input,
+    output: nativeWrite.output,
+    async execute(input: WriteToolInput, context: ToolContext) {
+      const native = (await nativeWrite.execute(input, context)) as NativeToolResult
+      let registration: WrittenRegistration | null
+      try {
+        registration = await service.registerWritten(input.path)
+      } catch {
+        // The write has landed, so a failed registration — boundary or any other error
+        // from the read-back/store — must not fail the tool; no header without a Snapshot.
+        registration = null
+      }
+      if (!registration) return native
+      const header = registration.header
+      const content =
+        typeof native.content === "string" && native.content !== "" ? `${native.content}\n${header}` : header
+      return {
+        ...native,
+        content,
+        metadata: { ...native.metadata, ...serializableWriteMetadata(registration) },
+      }
     },
   }
 }
@@ -319,9 +400,10 @@ function makeEditTool({ service }: { service: HashlineService }): Info {
     input: EDIT_INPUT,
     async execute(input: EditToolInput, _context: ToolContext) {
       const result = await service.edit(input.patch)
-      const content = result.sections
-        .map((section) => `${section.header}\nfirstChangedLine: ${section.firstChangedLine}`)
-        .join("\n")
+      const content = [
+        ...result.warnings.map((warning) => `warning: ${warning}`),
+        ...result.sections.map((section) => `${section.header}\nfirstChangedLine: ${section.firstChangedLine}`),
+      ].join("\n")
       return { content, metadata: serializableEditMetadata(result) }
     },
   }
@@ -350,15 +432,17 @@ function makeSurfaceHook(list: HashlinePluginInput["tool"]["list"]): (event: Sur
 
 export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem?: FileSystemAdapter): Promise<() => Promise<void>> {
   const directory = path.resolve(input.location.directory)
+  const projectDirectory = path.resolve(input.location.project?.directory ?? input.location.directory)
   const settings = resolveHashlineSettings(input.options, directory)
-  const assertBoundary = readBoundary(directory, await Promise.all([directory, ...settings.roots].map((root) => realpath(root))))
+  const roots = await Promise.all([projectDirectory, ...settings.roots].map((root) => realpath(root)))
+  const withinRoot = readBoundary(directory, roots)
   const store = new InMemorySnapshotStore({
     maxPaths: settings.maxPaths,
     maxVersionsPerPath: settings.maxVersionsPerPath,
     maxTotalBytes: settings.maxTotalBytes,
   })
   const service = new HashlineService({
-    worktree: directory,
+    worktree: projectDirectory,
     directory,
     roots: settings.roots,
     filesystem,
@@ -368,8 +452,10 @@ export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem
 
   const registration = await input.tool.transform((editor: ToolEditor) => {
     const nativeRead = editor.get(READ_NAME)
-    editor.add(makeReadTool({ service, nativeRead, assertBoundary }))
+    editor.add(makeReadTool({ service, nativeRead, withinRoot, roots, maxTaggedReadBytes: settings.maxTaggedReadBytes }))
     editor.add(makeEditTool({ service }))
+    const nativeWrite = editor.get(WRITE_NAME)
+    if (nativeWrite) editor.add(makeWriteTool({ service, nativeWrite }))
   })
   const surfaceHook = makeSurfaceHook(input.tool.list)
   const hookRegistrations = await Promise.all(

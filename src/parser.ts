@@ -1,6 +1,7 @@
 import { SnapshotRequiredError } from "./errors.ts"
 
 const SECTION_HEADER_RE = /^\[(.+)#([0-9a-fA-F]{4})\]$/
+const SECTION_HEADER_WITH_HUNK_RE = /^\[(.+)#([0-9a-fA-F]{4})\]\s+(\S.*)$/
 const REPLACE_RE = /^replace\s+([1-9]\d*)(?:-([1-9]\d*))?\s*$/
 const INSERT_BEFORE_RE = /^insert\s+before\s+([1-9]\d*)\s*$/
 const INSERT_AFTER_RE = /^insert\s+after\s+([1-9]\d*)\s*$/
@@ -33,6 +34,7 @@ export interface PatchSection {
 
 export interface ParsedPatch {
   sections: PatchSection[]
+  warnings: string[]
 }
 
 export class PatchSyntaxError extends Error {
@@ -56,11 +58,51 @@ function unsupportedOperation(
   )
 }
 
+interface InlineHunk {
+  path: string
+  tag: string
+  hunkLine: string
+}
+
+function inlineHunkMatch(line: string): InlineHunk | undefined {
+  const match = SECTION_HEADER_WITH_HUNK_RE.exec(line)
+  if (!match || !isHunkHeaderLine(match[3])) return undefined
+  return { path: match[1], tag: match[2].toUpperCase(), hunkLine: match[3] }
+}
+
+function isHunkHeaderLine(line: string): boolean {
+  return (
+    REPLACE_RE.test(line) ||
+    INSERT_BEFORE_RE.test(line) ||
+    INSERT_AFTER_RE.test(line) ||
+    APPEND_RE.test(line)
+  )
+}
+
+function correctHunkLine(line: string, lineNumber: number, warnings: string[]): string | undefined {
+  if (isHunkHeaderLine(line)) return undefined
+  if (line.startsWith("+") && isHunkHeaderLine(line.slice(1))) {
+    warnings.push(
+      `line ${lineNumber}: removed the leading '+' from the hunk header ${JSON.stringify(line)}; hunk lines never start with '+'`,
+    )
+    return line.slice(1)
+  }
+  const wrapped = /^@@(.+)@@$/.exec(line)
+  if (wrapped && isHunkHeaderLine(wrapped[1].trim())) {
+    warnings.push(
+      `line ${lineNumber}: removed the '@@' wrapper around the hunk header ${JSON.stringify(line)}`,
+    )
+    return wrapped[1].trim()
+  }
+  return undefined
+}
+
 type ReplaceHeader = Omit<ReplaceHunk, "body">
 type InsertHeader = Omit<InsertHunk, "body">
 
-function parseHunkHeader(line: string, lineNumber: number): ReplaceHeader | InsertHeader {
-  const match = REPLACE_RE.exec(line)
+function parseHunkHeader(line: string, lineNumber: number, warnings: string[]): ReplaceHeader | InsertHeader {
+  const corrected = correctHunkLine(line, lineNumber, warnings) ?? line
+  const match = REPLACE_RE.exec(corrected)
   if (match) {
     const start = Number(match[1])
     const end = Number(match[2] ?? match[1])
@@ -70,48 +112,52 @@ function parseHunkHeader(line: string, lineNumber: number): ReplaceHeader | Inse
     return { operation: "replace", start, end }
   }
 
-  const before = INSERT_BEFORE_RE.exec(line)
+  const before = INSERT_BEFORE_RE.exec(corrected)
   if (before) return { operation: "insert", placement: "before", line: Number(before[1]) }
 
-  const after = INSERT_AFTER_RE.exec(line)
+  const after = INSERT_AFTER_RE.exec(corrected)
   if (after) return { operation: "insert", placement: "after", line: Number(after[1]) }
 
-  if (APPEND_RE.test(line)) return { operation: "insert", placement: "append" }
+  if (APPEND_RE.test(corrected)) return { operation: "insert", placement: "append" }
 
-  if (/^PUT(?:\s|$)/.test(line)) {
-    unsupportedOperation(line, lineNumber, "PUT", "Oh My Pi syntax not supported; see the edit tool description")
+  // Detectors see the corrected form so a leaked body-row '+' (e.g. `+PUT 3`) still
+  // surfaces the specific unsupported-op message; correction itself stays limited to
+  // unambiguous hunk-header forms.
+  const detected = corrected.startsWith("+") ? corrected.slice(1) : corrected
+  if (/^PUT(?:\s|$)/.test(detected)) {
+    unsupportedOperation(detected, lineNumber, "PUT", "Oh My Pi syntax not supported; see the edit tool description")
   }
-  if (/\.=/.test(line)) {
-    unsupportedOperation(line, lineNumber, ".=", "Oh My Pi syntax not supported; see the edit tool description")
+  if (/\.=/.test(detected)) {
+    unsupportedOperation(detected, lineNumber, ".=", "Oh My Pi syntax not supported; see the edit tool description")
   }
-  if (/^CUT(?:\s|$)/.test(line)) {
-    unsupportedOperation(line, lineNumber, "CUT", "clipboard not supported")
+  if (/^CUT(?:\s|$)/.test(detected)) {
+    unsupportedOperation(detected, lineNumber, "CUT", "clipboard not supported")
   }
-  if (/^REM(?:\s|$)/.test(line)) {
+  if (/^REM(?:\s|$)/.test(detected)) {
     unsupportedOperation(
-      line,
+      detected,
       lineNumber,
       "REM",
       "deletion and movement are not part of v1; use guarded_bash",
     )
   }
-  if (/^MV(?:\s|$)/.test(line)) {
+  if (/^MV(?:\s|$)/.test(detected)) {
     unsupportedOperation(
-      line,
+      detected,
       lineNumber,
       "MV",
       "deletion and movement are not part of v1; use guarded_bash",
     )
   }
-  if (/^@/.test(line)) {
-    unsupportedOperation(line, lineNumber, line, "clipboard not supported")
+  if (/^@/.test(detected)) {
+    unsupportedOperation(detected, lineNumber, detected, "clipboard not supported")
   }
-  if (/^(?:replace\s+)?[1-9]\d*\*\s*$/.test(line) || /^N\*\s*$/.test(line)) {
-    unsupportedOperation(line, lineNumber, "N*", "block ops not supported; use replace N-M")
+  if (/^(?:replace\s+)?[1-9]\d*\*\s*$/.test(detected) || /^N\*\s*$/.test(detected)) {
+    unsupportedOperation(detected, lineNumber, "N*", "block ops not supported; use replace N-M")
   }
 
   throw new PatchSyntaxError(
-    `expected "replace N-M" or "replace N", got ${JSON.stringify(line)}; v1 alternative: ${V1_REPLACE_ALTERNATIVE}`,
+    `expected "replace N-M" or "replace N", got ${JSON.stringify(line)}; v1 alternative: ${V1_REPLACE_ALTERNATIVE}; call read and copy its header, then rewrite the hunk line`,
     lineNumber,
   )
 }
@@ -125,7 +171,7 @@ function parseSectionHeader(line: string, lineNumber: number): PatchSection {
   const match = SECTION_HEADER_RE.exec(line)
   if (!match || match[1].trim() === "") {
     throw new PatchSyntaxError(
-      `expected [PATH#TAG] with a four-hex TAG, got ${JSON.stringify(line)}`,
+      `expected [PATH#TAG] with a four-hex TAG, got ${JSON.stringify(line)}; call read and copy its header verbatim; invented tags are always rejected`,
       lineNumber,
     )
   }
@@ -149,7 +195,17 @@ export function parsePatch(input: unknown): ParsedPatch {
 
   const lines = input.replace(/\r\n?/g, "\n").split("\n")
   const sections: PatchSection[] = []
+  const warnings: string[] = []
   let index = 0
+
+  const readBody = (): string[] => {
+    const body: string[] = []
+    while (index < lines.length && lines[index].startsWith("+")) {
+      body.push(lines[index].slice(1))
+      index += 1
+    }
+    return body
+  }
 
   while (index < lines.length) {
     const line = lines[index]
@@ -159,9 +215,17 @@ export function parsePatch(input: unknown): ParsedPatch {
       continue
     }
 
-    const section = parseSectionHeader(line, lineNumber)
+    const inline = inlineHunkMatch(line)
+    const section = parseSectionHeader(inline ? `[${inline.path}#${inline.tag}]` : line, lineNumber)
     sections.push(section)
     index += 1
+
+    if (inline) {
+      warnings.push(
+        `line ${lineNumber}: moved the hunk header ${JSON.stringify(inline.hunkLine)} off the section header line`,
+      )
+      section.hunks.push({ ...parseHunkHeader(inline.hunkLine, lineNumber, warnings), body: readBody() })
+    }
 
     while (index < lines.length) {
       const hunkLine = lines[index]
@@ -172,18 +236,14 @@ export function parsePatch(input: unknown): ParsedPatch {
         continue
       }
       if (SECTION_HEADER_RE.test(hunkLine)) break
+      if (inlineHunkMatch(hunkLine)) break
       if (/^\[[^\]]+\]$/.test(hunkLine)) {
         parseSectionHeader(hunkLine, hunkLineNumber)
       }
 
-      const hunk = parseHunkHeader(hunkLine, hunkLineNumber)
+      const hunk = parseHunkHeader(hunkLine, hunkLineNumber, warnings)
       index += 1
-      const body: string[] = []
-      while (index < lines.length && lines[index].startsWith("+")) {
-        body.push(lines[index].slice(1))
-        index += 1
-      }
-      section.hunks.push({ ...hunk, body })
+      section.hunks.push({ ...hunk, body: readBody() })
     }
 
     if (section.hunks.length === 0) {
@@ -191,6 +251,11 @@ export function parsePatch(input: unknown): ParsedPatch {
     }
   }
 
-  if (sections.length === 0) throw new PatchSyntaxError("patch has no sections", 1)
-  return { sections }
+  if (sections.length === 0) {
+    throw new PatchSyntaxError(
+      "patch has no sections; call read and copy its header verbatim; invented tags are always rejected",
+      1,
+    )
+  }
+  return { sections, warnings }
 }

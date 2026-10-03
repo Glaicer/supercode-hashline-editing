@@ -6,9 +6,17 @@ export class HashlineError extends Error {
 }
 
 export class BoundaryError extends HashlineError {
-  constructor() {
-    super("Path is outside the Snapshot Root")
+  path?: string
+  roots?: string[]
+  constructor(path?: string, roots?: string[]) {
+    super(
+      path
+        ? `Path ${path} is outside the Snapshot Root${roots?.length ? ` (roots: ${roots.join(", ")})` : ""}; hashline edit is unavailable for ${path}`
+        : "Path is outside the Snapshot Root",
+    )
     this.name = "BoundaryError"
+    this.path = path
+    this.roots = roots
   }
 }
 
@@ -17,17 +25,21 @@ export interface MismatchDetails {
   expectedTag: string
   actualTag: string
   reason?: string
+  liveLineCount?: number
 }
 
 export class MismatchError extends HashlineError {
   path: string
   expectedTag: string
   actualTag: string
-  constructor({ path, expectedTag, actualTag, reason }: MismatchDetails) {
+  constructor({ path, expectedTag, actualTag, reason, liveLineCount }: MismatchDetails) {
+    const details = [liveLineCount === undefined ? undefined : `${liveLineCount} lines`, reason]
+      .filter((part) => part !== undefined)
+      .join("; ")
     super(
       `Snapshot mismatch for ${path}: section uses #${expectedTag}, live file is #${actualTag}${
-        reason ? ` (${reason})` : ""
-      }; re-read the file and retry`,
+        details ? ` (${details})` : ""
+      }. If your line numbers still apply, retry with this header: [${path}#${actualTag}]; if the file shifted, re-read around your hunks`,
     )
     this.name = "MismatchError"
     this.path = path
@@ -42,7 +54,7 @@ export class SnapshotRequiredError extends HashlineError {
   constructor(path: string, readHeader?: string) {
     super(readHeader
       ? `Path spelling mismatch for ${path}; this file was read using a different path spelling. Use this read header verbatim:\n${readHeader}\nRetry with this exact header; do not shorten or normalize PATH or reconstruct TAG.`
-      : `No live Snapshot exists for ${path}; call read first, then copy its entire [PATH#TAG] header verbatim`)
+      : `No live Snapshot exists for ${path}; call read first, then copy its entire [PATH#TAG] header verbatim. Snapshots are in-memory and were reset after a restart or location switch.`)
     this.name = "SnapshotRequiredError"
     this.path = path
     this.readHeader = readHeader
@@ -114,9 +126,9 @@ export class SeenLinesError extends HashlineError {
   constructor({ path, missingLines, revealed, truncated }: SeenLinesDetails) {
     const preview = revealed.map(({ line, text }) => `${line}:${text}`).join("\n")
     super(
-      `SeenLines guard rejected an edit for ${path}; re-read the missing lines and retry${
-        preview ? `\n${preview}` : ""
-      }`,
+      truncated
+        ? `SeenLines guard rejected an edit for ${path}\n${preview}\nRe-read the missing lines with offset ${missingLines[0]} and retry`
+        : `SeenLines guard rejected an edit for ${path}\n${preview}\nThe missing lines are shown above; retry the edit now with the same header — no re-read needed`,
     )
     this.name = "SeenLinesError"
     this.path = path

@@ -16,6 +16,7 @@ import {
   SnapshotRequiredError,
 } from "./service.ts"
 import { computeTag } from "./hash.ts"
+import { FileSystemAdapter } from "./filesystem.ts"
 
 /** Commit-report fields are attached dynamically; narrow `unknown` rejections to read them. */
 interface RejectedEdit extends Error {
@@ -29,6 +30,12 @@ interface RejectedEdit extends Error {
 
 function asRejected(error: unknown): RejectedEdit {
   return error as RejectedEdit
+}
+
+function liveHeaderFrom(error: MismatchError): string {
+  const header = /retry with this header: (\[[^\]]+\])/.exec(error.message)?.[1]
+  assert.ok(header, "mismatch message must carry the ready-to-copy live header")
+  return header
 }
 
 let root: string
@@ -130,6 +137,8 @@ test("unseen anchors reveal a bounded preview and allow a retry when complete", 
     const seenLinesError = error as SeenLinesError
     assert.deepEqual(seenLinesError.revealed, [{ line: 9, text: "line-9" }])
     assert.equal(seenLinesError.truncated, false)
+    assert.match(seenLinesError.message, /The missing lines are shown above; retry the edit now with the same header — no re-read needed/)
+    assert.match(seenLinesError.message, /\n9:line-9\n/)
     return true
   })
 
@@ -150,6 +159,8 @@ test("long or over-cap previews stay truncated and do not authorize a retry", as
     assert.equal(seenLinesError.truncated, true)
     assert.equal(seenLinesError.revealed[0].text.length, 512)
     assert.equal(seenLinesError.revealed[0].text.at(-1), "…")
+    assert.match(seenLinesError.message, /Re-read the missing lines with offset 2 and retry/)
+    assert.doesNotMatch(seenLinesError.message, /retry the edit now/)
     return true
   })
   await assert.rejects(service.edit(patch), (error: unknown) => error instanceof SeenLinesError)
@@ -171,6 +182,7 @@ test("reveal previews cap at forty missing lines", async () => {
     assert.equal(seenLinesError.revealed[0].line, 2)
     assert.equal(seenLinesError.revealed.at(-1)?.line, 41)
     assert.equal(seenLinesError.truncated, true)
+    assert.match(seenLinesError.message, /Re-read the missing lines with offset 2 and retry/)
     return true
   })
   await assert.rejects(service.edit(patch), (error: unknown) => error instanceof SeenLinesError)
@@ -206,6 +218,104 @@ test("stale content fails before writing and asks for a re-read", async () => {
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "changed\ntwo\nthree\n")
 })
 
+test("stale mismatches carry the live header and line count for a no-read retry", async () => {
+  const reading = await service.read("a.ts")
+  await writeFile(path.join(root, "a.ts"), "changed\ntwo\nthree\n")
+  const liveTag = computeTag("changed\ntwo\nthree\n")
+
+  await assert.rejects(
+    service.edit(`${reading.header}\nreplace 1\n+ONE`),
+    (error: unknown) => {
+      assert.ok(error instanceof MismatchError)
+      assert.equal(
+        error.message.split("; hashline commit report:")[0],
+        `Snapshot mismatch for a.ts: section uses #${reading.tag}, live file is #${liveTag} (3 lines). If your line numbers still apply, retry with this header: [a.ts#${liveTag}]; if the file shifted, re-read around your hunks`,
+      )
+      return true
+    },
+  )
+})
+
+test("an external append is editable through the live header without a re-read", async () => {
+  const reading = await service.read("a.ts")
+  await writeFile(path.join(root, "a.ts"), "one\ntwo\nthree\nfour\n")
+
+  const failure = await service
+    .edit(`${reading.header}\nreplace 1\n+ONE`)
+    .then(() => null, (error: unknown) => error)
+  assert.ok(failure instanceof MismatchError)
+  assert.match(failure.message, /live file is #[0-9A-F]{4} \(4 lines\)/)
+  const liveHeader = liveHeaderFrom(failure)
+
+  const patch = `${liveHeader}\nreplace 1\n+ONE`
+  // The first live-header attempt only registers the observed bytes and rejects; the identical retry resolves.
+  await assert.rejects(service.edit(patch), (error: unknown) => error instanceof MismatchError)
+  const result = await service.edit(patch)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "ONE\ntwo\nthree\nfour\n")
+  assert.equal(result.sections[0].firstChangedLine, 1)
+})
+
+test("a numbering shift rejects a live-header retry with old line numbers instead of corrupting the file", async () => {
+  const reading = await service.read("a.ts")
+  await writeFile(path.join(root, "a.ts"), "zero\none\ntwo\nthree\n")
+
+  const failure = await service
+    .edit(`${reading.header}\nreplace 2\n+TWO!`)
+    .then(() => null, (error: unknown) => error)
+  assert.ok(failure instanceof MismatchError)
+  const patch = `${liveHeaderFrom(failure)}\nreplace 2\n+TWO!`
+
+  await assert.rejects(service.edit(patch), (error: unknown) => {
+    assert.ok(error instanceof MismatchError)
+    assert.match(error.message, /live file is #[0-9A-F]{4} \(4 lines\)/)
+    return true
+  })
+  await assert.rejects(service.edit(patch), (error: unknown) => {
+    assert.ok(error instanceof SeenLinesError)
+    assert.deepEqual((error as SeenLinesError).revealed, [{ line: 2, text: "one" }])
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "zero\none\ntwo\nthree\n")
+})
+
+test("a seen line changed externally is not silently editable after the live-header retry", async () => {
+  const reading = await service.read("a.ts")
+  await writeFile(path.join(root, "a.ts"), "one\nCHANGED\nthree\n")
+
+  const failure = await service
+    .edit(`${reading.header}\nreplace 2\n+TWO!`)
+    .then(() => null, (error: unknown) => error)
+  assert.ok(failure instanceof MismatchError)
+  const patch = `${liveHeaderFrom(failure)}\nreplace 2\n+TWO!`
+
+  await assert.rejects(service.edit(patch), (error: unknown) => error instanceof MismatchError)
+  await assert.rejects(service.edit(patch), (error: unknown) => {
+    assert.ok(error instanceof SeenLinesError)
+    assert.deepEqual((error as SeenLinesError).revealed, [{ line: 2, text: "CHANGED" }])
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\nCHANGED\nthree\n")
+})
+
+test("a shrunken file rejects old line numbers after the live-header retry", async () => {
+  const reading = await service.read("a.ts")
+  await writeFile(path.join(root, "a.ts"), "one\n")
+
+  const failure = await service
+    .edit(`${reading.header}\nreplace 3\n+THREE!`)
+    .then(() => null, (error: unknown) => error)
+  assert.ok(failure instanceof MismatchError)
+  const patch = `${liveHeaderFrom(failure)}\nreplace 3\n+THREE!`
+
+  await assert.rejects(service.edit(patch), (error: unknown) => error instanceof MismatchError)
+  await assert.rejects(service.edit(patch), (error: unknown) => {
+    assert.ok(error instanceof LineRangeError)
+    assert.match((error as LineRangeError).message, /Line 3 does not exist \(file has 1 lines\)/)
+    return true
+  })
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\n")
+})
+
 test("multi-section preflight rejects a stale later file before writing the first", async () => {
   await writeFile(path.join(root, "b.ts"), "alpha\nbeta\n")
   const aReading = await service.read("a.ts")
@@ -235,6 +345,54 @@ test("multi-section preflight rejects a stale later file before writing the firs
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
 })
 
+test("a retargeted path reports the live line count in its mismatch", async () => {
+  const link = path.join(root, "link.ts")
+  await writeFile(path.join(root, "b.ts"), "one\ntwo\nthree\n")
+  await symlink(path.join(root, "a.ts"), link)
+  const reading = await service.read("link.ts")
+  await rm(link)
+  await symlink(path.join(root, "b.ts"), link)
+
+  await assert.rejects(
+    service.edit(`${reading.header}\nreplace 1\n+NOPE`),
+    (error: unknown) => {
+      assert.ok(error instanceof MismatchError)
+      assert.match(
+        error.message.split("; hashline commit report:")[0],
+        /live file is #[0-9A-F]{4} \(3 lines; the read path now resolves to a different file\)/,
+      )
+      return true
+    },
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
+})
+
+test("drift caught during staging reports the live line count too", async () => {
+  const changed = "external\ntwo\nthree\n"
+  const racing = new HashlineService({
+    worktree: root,
+    directory: root,
+    filesystem: new class extends FileSystemAdapter {
+      override async prepareAtomic(input: Parameters<FileSystemAdapter["prepareAtomic"]>[0]) {
+        await writeFile(path.join(root, "a.ts"), changed)
+        return super.prepareAtomic(input)
+      }
+    }({ root }),
+  })
+  const reading = await racing.read("a.ts")
+
+  await assert.rejects(
+    racing.edit(`${reading.header}\nreplace 1\n+ONE`),
+    (error: unknown) => {
+      assert.ok(error instanceof MismatchError)
+      assert.equal((error as MismatchError).actualTag, computeTag(changed))
+      assert.match(error.message, new RegExp(`live file is #${computeTag(changed)} \\(3 lines\\)`))
+      return true
+    },
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), changed)
+})
+
 test("multi-section preflight rejects duplicate canonical paths", async () => {
   const link = path.join(root, "link.ts")
   await symlink(path.join(root, "a.ts"), link)
@@ -261,6 +419,16 @@ test("multi-section preflight rejects duplicate canonical paths", async () => {
     },
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
+})
+
+test("tolerated hunk fixes surface as warnings on the edit result", async () => {
+  const reading = await service.read("a.ts")
+
+  const result = await service.edit([reading.header, "+replace 1", "+ONE"].join("\n"))
+
+  assert.equal(result.sections[0].after, "ONE\ntwo\nthree\n")
+  assert.equal(result.warnings.length, 1)
+  assert.match(result.warnings[0], /removed the leading '\+' from the hunk header "\+replace 1"/)
 })
 
 test("syntax failures still carry an empty commit report", async () => {
@@ -371,6 +539,49 @@ test("edit refuses missing files and points to the native write tool", async () 
   )
 })
 
+test("registerWritten records the live bytes so an immediate edit succeeds without a read", async () => {
+  await writeFile(path.join(root, "written.ts"), "alpha\nbeta\n")
+  const registration = await service.registerWritten("written.ts")
+  assert.ok(registration)
+  assert.match(registration.header, /^\[written\.ts#[0-9A-F]{4}\]$/)
+  assert.equal(registration.tag, computeTag("alpha\nbeta\n"))
+  assert.equal(registration.path, "written.ts")
+  assert.equal(registration.canonicalPath, path.join(root, "written.ts"))
+
+  const result = await service.edit(`${registration.header}\nreplace 1\n+ALPHA`)
+  assert.equal(await readFile(path.join(root, "written.ts"), "utf8"), "ALPHA\nbeta\n")
+  assert.equal(result.sections[0].firstChangedLine, 1)
+})
+
+test("registerWritten normalizes like read so an edit right after write cannot mismatch", async () => {
+  await writeFile(path.join(root, "bom.txt"), "\uFEFFone\r\ntwo\r\n")
+  const registration = await service.registerWritten("bom.txt")
+  assert.ok(registration)
+  assert.equal(registration.tag, computeTag("one\ntwo\n"))
+  const result = await service.edit(`${registration.header}\nreplace 2\n+TWO`)
+  assert.equal(await readFile(path.join(root, "bom.txt"), "utf8"), "\uFEFFone\r\nTWO\r\n")
+})
+
+test("registerWritten ignores paths outside the Snapshot Root", async () => {
+  assert.equal(await service.registerWritten(path.join(outside, "secret.ts")), null)
+  await assert.rejects(
+    service.edit(`[${path.join(outside, "secret.ts")}#AAAA]\nreplace 1\n+X`),
+    (error: unknown) => error instanceof BoundaryError,
+  )
+  assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
+})
+
+test("the no-snapshot error explains that restarts reset in-memory snapshots", async () => {
+  await assert.rejects(
+    service.edit("[a.ts#AAAA]\nreplace 1\n+X"),
+    (error: unknown) => {
+      assert.ok(error instanceof SnapshotRequiredError)
+      assert.match(error.message, /Snapshots are in-memory and were reset after a restart or location switch/)
+      return true
+    },
+  )
+})
+
 test("invalid ranges fail before writing with the file line count", async () => {
   const reading = await service.read("a.ts")
 
@@ -387,6 +598,25 @@ test("boundary failures do not reveal or write files outside the root", async ()
 
   await symlink(path.join(outside, "secret.ts"), path.join(root, "link.ts"))
   await assert.rejects(service.read("link.ts"), (error: unknown) => error instanceof BoundaryError)
+  assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
+})
+
+test("boundary rejections name the requested path and the actual roots", async () => {
+  await assert.rejects(service.read(path.join(outside, "secret.ts")), (error: unknown) => {
+    assert.ok(error instanceof BoundaryError)
+    assert.ok(error.message.includes(`Path ${path.join(outside, "secret.ts")} is outside the Snapshot Root`))
+    assert.ok(error.message.includes(`roots: ${root}`))
+    assert.match(error.message, /hashline edit is unavailable/)
+    return true
+  })
+
+  await assert.rejects(service.edit("[../secret.ts#AAAA]\nreplace 1\n+leak"), (error: unknown) => {
+    assert.ok(error instanceof BoundaryError)
+    assert.ok(error.message.startsWith("Path ../secret.ts is outside the Snapshot Root"))
+    assert.ok(error.message.includes(`roots: ${root}`))
+    assert.deepEqual(asRejected(error).written, [])
+    return true
+  })
   assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
 })
 

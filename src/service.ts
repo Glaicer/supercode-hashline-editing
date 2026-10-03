@@ -45,6 +45,14 @@ export interface ReadResult {
   seenLines: number[]
 }
 
+export interface WrittenRegistration {
+  path: string
+  canonicalPath: string
+  rootId: string
+  tag: string
+  header: string
+}
+
 export interface SectionResult {
   path: string
   canonicalPath: string
@@ -62,6 +70,7 @@ export interface SectionResult {
 
 export interface EditResult {
   sections: SectionResult[]
+  warnings: string[]
   written: string[]
   rolledBack: string[]
   partiallyWritten: string[]
@@ -122,11 +131,26 @@ function capabilityKey(inputPath: string, rootId: string): string {
   return `${rootId}\u0000${inputPath}`
 }
 
-function mapFilesystemError(error: unknown, operation: string, displayPath: string, expectedTag?: string): unknown {
-  if (error instanceof PathBoundaryError) return new BoundaryError()
+function mismatchError(path: string, expectedTag: string, liveText: string, reason?: string): MismatchError {
+  return new MismatchError({
+    path,
+    expectedTag,
+    actualTag: computeTag(liveText),
+    reason,
+    liveLineCount: splitAddressableLines(liveText).length,
+  })
+}
+
+function mapFilesystemError(
+  error: unknown,
+  operation: string,
+  displayPath: string,
+  options?: { expectedTag?: string; roots?: string[] },
+): unknown {
+  if (error instanceof PathBoundaryError) return new BoundaryError(displayPath, options?.roots)
   if (error instanceof FileNotFoundError && operation === "edit") return new MissingFileError(displayPath)
-  if (error instanceof LiveFileChangedError && expectedTag) {
-    return new MismatchError({ path: displayPath, expectedTag, actualTag: computeTag(error.actualText) })
+  if (error instanceof LiveFileChangedError && options?.expectedTag) {
+    return mismatchError(displayPath, options.expectedTag, error.actualText)
   }
   return error
 }
@@ -395,7 +419,7 @@ export class HashlineService {
     try {
       return await this.filesystem.read(inputPath, this.directory)
     } catch (error) {
-      throw mapFilesystemError(error, operation, inputPath)
+      throw mapFilesystemError(error, operation, inputPath, { roots: await this.filesystem.snapshotRoots() })
     }
   }
 
@@ -430,6 +454,28 @@ export class HashlineService {
     }
   }
 
+  async registerWritten(inputPath: string): Promise<WrittenRegistration | null> {
+    let file: ReadFileResult
+    try {
+      file = await this.filesystem.read(inputPath, this.directory)
+    } catch (error) {
+      if (error instanceof PathBoundaryError) return null
+      throw error
+    }
+    const lines = splitAddressableLines(file.text)
+    const snapshot = this.store.record({
+      canonicalPath: file.canonicalPath,
+      rootId: file.rootId,
+      text: file.text,
+      seenLines: asLineNumbers(1, lines, () => true),
+      lineEnding: file.lineEnding,
+      bom: file.bom,
+    })
+    const header = formatHeader(inputPath, snapshot.tag)
+    this.readCapabilities.set(capabilityKey(inputPath, file.rootId), { canonicalPath: file.canonicalPath, header })
+    return { path: inputPath, canonicalPath: file.canonicalPath, rootId: file.rootId, tag: snapshot.tag, header }
+  }
+
   _resolveSnapshot(section: PatchSection, file: ReadFileResult): Snapshot {
     const capability = this.readCapabilities.get(capabilityKey(section.path, file.rootId))
     if (!capability) {
@@ -442,12 +488,7 @@ export class HashlineService {
       throw new SnapshotRequiredError(section.path, readHeader)
     }
     if (capability.canonicalPath !== file.canonicalPath) {
-      throw new MismatchError({
-        path: section.path,
-        expectedTag: section.tag,
-        actualTag: computeTag(file.text),
-        reason: "the read path now resolves to a different file",
-      })
+      throw mismatchError(section.path, section.tag, file.text, "the read path now resolves to a different file")
     }
 
     const { candidates, exact } = this.store.exactMatches(
@@ -457,21 +498,43 @@ export class HashlineService {
       file.text,
     )
     if (candidates.length === 0) {
-      throw new MismatchError({
-        path: section.path,
-        expectedTag: section.tag,
-        actualTag: computeTag(file.text),
-      })
+      this._registerObservedLiveSnapshot(file)
+      throw mismatchError(section.path, section.tag, file.text)
     }
     if (candidates.length !== 1 || exact.length !== 1) {
-      throw new MismatchError({
-        path: section.path,
-        expectedTag: section.tag,
-        actualTag: computeTag(file.text),
-      })
+      throw mismatchError(section.path, section.tag, file.text)
     }
 
     return exact[0]
+  }
+
+  /**
+   * Record the live bytes observed at a mismatch so a retry with the fresh
+   * header can resolve without a re-read. Observation only: writes stay gated
+   * by byte-match revalidation, and only lines identical to the newest known
+   * version carry their seen state over.
+   */
+  _registerObservedLiveSnapshot(file: ReadFileResult): void {
+    const [prior] = this.store.find(file.canonicalPath, file.rootId)
+    const liveLines = splitAddressableLines(file.text)
+    const seenLines = new Set<number>()
+    if (prior) {
+      const priorLines = splitAddressableLines(prior.text)
+      const shared = Math.min(priorLines.length, liveLines.length)
+      for (let index = 0; index < shared; index += 1) {
+        if (priorLines[index] === liveLines[index] && prior.seenLines.has(index + 1)) {
+          seenLines.add(index + 1)
+        }
+      }
+    }
+    this.store.record({
+      canonicalPath: file.canonicalPath,
+      rootId: file.rootId,
+      text: file.text,
+      seenLines,
+      lineEnding: file.lineEnding,
+      bom: file.bom,
+    })
   }
 
   _prepareSection(section: PatchSection, file: ReadFileResult): PreparedPlan {
@@ -523,7 +586,7 @@ export class HashlineService {
     return cleanupErrors
   }
 
-  async _commitPlans(plans: PreparedPlan[]): Promise<EditResult> {
+  async _commitPlans(plans: PreparedPlan[], warnings: string[]): Promise<EditResult> {
     const paths = plans.map((plan) => plan.file.canonicalPath)
     const prepared: PreparedAtomic[] = []
 
@@ -546,7 +609,7 @@ export class HashlineService {
             }),
           )
         } catch (error) {
-          throw mapFilesystemError(error, "edit", plan.section.path, plan.section.tag)
+          throw mapFilesystemError(error, "edit", plan.section.path, { expectedTag: plan.section.tag, roots: await this.filesystem.snapshotRoots() })
         }
       }
     } catch (error) {
@@ -566,7 +629,7 @@ export class HashlineService {
           const committed = await this.filesystem.commitPrepared(prepared[index])
           forward.push({ plan, committed })
         } catch (error) {
-          const mapped = mapFilesystemError(error, "edit", plan.section.path, plan.section.tag)
+          const mapped = mapFilesystemError(error, "edit", plan.section.path, { expectedTag: plan.section.tag, roots: await this.filesystem.snapshotRoots() })
           if ((mapped as { committed?: unknown }).committed) {
             forward.push({ plan, committed: mapped as { persistedText?: string } })
           }
@@ -645,6 +708,7 @@ export class HashlineService {
       }
       return {
         sections: sectionResults,
+        warnings,
         written: [...paths],
         rolledBack: [],
         partiallyWritten: [],
@@ -683,7 +747,7 @@ export class HashlineService {
       }
 
       const plans = resolved.map(({ section, file }) => this._prepareSection(section, file))
-      return await this._commitPlans(plans)
+      return await this._commitPlans(plans, parsed.warnings)
     } catch (error) {
       if ((error as { report?: unknown }).report) throw error
       const reportPaths = uniquePaths([
