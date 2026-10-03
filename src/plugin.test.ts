@@ -1015,6 +1015,14 @@ test("a small maxTaggedReadBytes budget truncates the tagged window earlier", as
     /^\[big\.txt#[0-9A-F]{4}\]\n1:x{100}\nLines 1-1 shown; lines outside this range are NOT seen and cannot be edited until read\n\[Output truncated\. Continue reading with offset: 2\]$/,
   )
   assert.deepEqual(budgetRead.metadata.seenLines, [1])
+
+  const starved = await createHarness({ directory: root, options: { maxTaggedReadBytes: 200 }, nativeRead })
+  const starvedRead = await readTool(starved.tools).execute({ path: "big.txt" }, CONTEXT)
+  assert.match(
+    String(starvedRead.content),
+    /^\[big\.txt#[0-9A-F]{4}\]\nNo lines are shown; read the file to edit it\n\[Output truncated\. Continue reading with offset: 1\]$/,
+  )
+  assert.deepEqual(starvedRead.metadata.seenLines, [])
 })
 
 test("unseen Anchors reveal up to forty lines; truncated previews do not authorize retry", async () => {
