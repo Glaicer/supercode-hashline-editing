@@ -31,6 +31,9 @@ function visibilityNote(start: number, limit: number): string {
     : "No lines are shown; read the file to edit it"
 }
 
+// Upper bound reserved from the read budget so note+footer always fit, whatever the window shows.
+const WORST_CASE_VISIBILITY_NOTE = visibilityNote(999999999, 999999999)
+
 const READ_DESCRIPTION = [
   "Read the contents of a file or directory.",
   "Text files are returned as a `[PATH#TAG]` header followed by the requested lines, each prefixed by its 1-based absolute line number as `N:TEXT`; the prefix is for reference and is not part of the file content.",
@@ -224,7 +227,7 @@ function nativeTextWindow(native: NativeToolResult, input: ReadToolInput, maxTag
   const maximum = Math.min(input.limit || MAX_READ_LINES, MAX_READ_LINES, lines.length)
   const start = input.offset || 1
   let budget = maxTaggedReadBytes - Buffer.byteLength(
-    `[${input.path}#FFFF]\n${visibilityNote(999999999, 999999999)}\n${TRUNCATION_FOOTER(999999999)}\n`,
+    `[${input.path}#FFFF]\n${WORST_CASE_VISIBILITY_NOTE}\n${TRUNCATION_FOOTER(999999999)}\n`,
   )
   let limit = 0
   for (const line of lines.slice(0, maximum)) {
@@ -289,13 +292,13 @@ function serializableEditMetadata(result: EditResult) {
 function makeReadTool({
   service,
   nativeRead,
-  assertBoundary,
+  withinRoot,
   roots,
   maxTaggedReadBytes,
 }: {
   service: HashlineService
   nativeRead: (Info & { readonly id: string }) | undefined
-  assertBoundary: (inputPath: string) => Promise<boolean>
+  withinRoot: (inputPath: string) => Promise<boolean>
   roots: string[]
   maxTaggedReadBytes: number
 }): Info {
@@ -311,11 +314,11 @@ function makeReadTool({
           "hashline read: the host read tool is unavailable, so hashline refuses to read without its native executor",
         )
       }
-      const insideRoot = await assertBoundary(input.path)
+      const insideRoot = await withinRoot(input.path)
       const native = (await nativeRead.execute(input, context)) as NativeToolResult
       if (!insideRoot) return withOutsideRootNote(native, input.path, roots)
       if (!isNativeTextResult(native)) {
-        if (!(await assertBoundary(input.path))) throw new BoundaryError(input.path, roots)
+        if (!(await withinRoot(input.path))) throw new BoundaryError(input.path, roots)
         return native
       }
 
@@ -368,7 +371,14 @@ function makeWriteTool({
     output: nativeWrite.output,
     async execute(input: WriteToolInput, context: ToolContext) {
       const native = (await nativeWrite.execute(input, context)) as NativeToolResult
-      const registration = await service.registerWritten(input.path)
+      let registration: WrittenRegistration | null
+      try {
+        registration = await service.registerWritten(input.path)
+      } catch {
+        // The write has landed, so a failed registration — boundary or any other error
+        // from the read-back/store — must not fail the tool; no header without a Snapshot.
+        registration = null
+      }
       if (!registration) return native
       const header = registration.header
       const content =
@@ -425,7 +435,7 @@ export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem
   const projectDirectory = path.resolve(input.location.project?.directory ?? input.location.directory)
   const settings = resolveHashlineSettings(input.options, directory)
   const roots = await Promise.all([projectDirectory, ...settings.roots].map((root) => realpath(root)))
-  const assertBoundary = readBoundary(directory, roots)
+  const withinRoot = readBoundary(directory, roots)
   const store = new InMemorySnapshotStore({
     maxPaths: settings.maxPaths,
     maxVersionsPerPath: settings.maxVersionsPerPath,
@@ -442,7 +452,7 @@ export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem
 
   const registration = await input.tool.transform((editor: ToolEditor) => {
     const nativeRead = editor.get(READ_NAME)
-    editor.add(makeReadTool({ service, nativeRead, assertBoundary, roots, maxTaggedReadBytes: settings.maxTaggedReadBytes }))
+    editor.add(makeReadTool({ service, nativeRead, withinRoot, roots, maxTaggedReadBytes: settings.maxTaggedReadBytes }))
     editor.add(makeEditTool({ service }))
     const nativeWrite = editor.get(WRITE_NAME)
     if (nativeWrite) editor.add(makeWriteTool({ service, nativeWrite }))

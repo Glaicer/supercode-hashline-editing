@@ -91,6 +91,17 @@ test("reports an address-specific v1 alternative for unsupported operations", ()
   }
 })
 
+test("a leaked body-row '+' before an unsupported op reports the specific message", () => {
+  assert.throws(
+    () => parsePatch("[a.ts#AAAA]\n+PUT 3"),
+    (error: unknown) => {
+      assert.ok(error instanceof PatchSyntaxError)
+      assert.match(error.message, /Oh My Pi syntax not supported/)
+      return true
+    },
+  )
+})
+
 test("reports a missing tag for a later section instead of parsing it as a hunk", () => {
   assert.throws(
     () => parsePatch("[a.ts#AAAA]\nreplace 1\n+one\n[b.ts]\nreplace 1\n+two"),
