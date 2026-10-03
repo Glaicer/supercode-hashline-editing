@@ -927,7 +927,7 @@ test("window reads keep absolute line numbers and union SeenLines across reads",
   })
 
   const first = await readTool(harness.tools).execute({ path: "a.ts", limit: 1 }, CONTEXT)
-  assert.match(first.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\n\[Output truncated\. Continue reading with offset: 2\]$/)
+  assert.match(first.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\nLines 1-1 shown; lines outside this range are NOT seen and cannot be edited until read\n\[Output truncated\. Continue reading with offset: 2\]$/)
   const tag = first.metadata.tag
 
   const second = await readTool(harness.tools).execute(
@@ -989,12 +989,40 @@ test("native byte-limited page bounds the tagged window and SeenLines", async ()
     },
   })
   const result = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
-  assert.match(result.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\n2:two\n\[Output truncated\. Continue reading with offset: 3\]$/)
+  assert.match(result.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\n2:two\nLines 1-2 shown; lines outside this range are NOT seen and cannot be edited until read\n\[Output truncated\. Continue reading with offset: 3\]$/)
   assert.deepEqual(result.metadata.seenLines, [1, 2])
   await assert.rejects(
     editTool(harness.tools).execute({ patch: `${result.metadata.header}\nreplace 3\n+THREE` }, CONTEXT),
     (error: unknown) => error instanceof SeenLinesError,
   )
+})
+
+test("a small maxTaggedReadBytes budget truncates the tagged window earlier", async () => {
+  const line = "x".repeat(100)
+  const text = `${Array.from({ length: 6 }, () => line).join("\n")}\n`
+  await writeFile(path.join(root, "big.txt"), text)
+  const nativeRead = { execute: async (input: AnyRecord) => nativeTextResult(String(input.path), text) }
+
+  const full = await createHarness({ directory: root, nativeRead })
+  const defaultRead = await readTool(full.tools).execute({ path: "big.txt" }, CONTEXT)
+  assert.doesNotMatch(String(defaultRead.content), /Output truncated/)
+  assert.deepEqual(defaultRead.metadata.seenLines, [1, 2, 3, 4, 5, 6])
+
+  const cramped = await createHarness({ directory: root, options: { maxTaggedReadBytes: 320 }, nativeRead })
+  const budgetRead = await readTool(cramped.tools).execute({ path: "big.txt" }, CONTEXT)
+  assert.match(
+    String(budgetRead.content),
+    /^\[big\.txt#[0-9A-F]{4}\]\n1:x{100}\nLines 1-1 shown; lines outside this range are NOT seen and cannot be edited until read\n\[Output truncated\. Continue reading with offset: 2\]$/,
+  )
+  assert.deepEqual(budgetRead.metadata.seenLines, [1])
+
+  const starved = await createHarness({ directory: root, options: { maxTaggedReadBytes: 200 }, nativeRead })
+  const starvedRead = await readTool(starved.tools).execute({ path: "big.txt" }, CONTEXT)
+  assert.match(
+    String(starvedRead.content),
+    /^\[big\.txt#[0-9A-F]{4}\]\nNo lines are shown; read the file to edit it\n\[Output truncated\. Continue reading with offset: 1\]$/,
+  )
+  assert.deepEqual(starvedRead.metadata.seenLines, [])
 })
 
 test("unseen Anchors reveal up to forty lines; truncated previews do not authorize retry", async () => {
@@ -1013,6 +1041,7 @@ test("unseen Anchors reveal up to forty lines; truncated previews do not authori
       assert.equal(error.revealed.length, 40)
       assert.equal(error.revealed[0].text, "line-2")
       assert.equal(error.truncated, true)
+      assert.match(error.message, /Re-read the missing lines with offset 2 and retry/)
       assert.deepEqual((error as AnyRecord).written, [])
       return true
     })
@@ -1022,10 +1051,12 @@ test("unseen Anchors reveal up to forty lines; truncated previews do not authori
     assert.ok(error instanceof SeenLinesError)
     assert.deepEqual(error.revealed, [{ line: 2, text: "line-2" }])
     assert.equal(error.truncated, false)
+    assert.match(error.message, /The missing lines are shown above; retry the edit now with the same header — no re-read needed/)
     return true
   })
   await edit.execute({ patch: shortPatch }, CONTEXT)
   assert.equal((await readFile(path.join(root, "a.ts"), "utf8")).split("\n")[1], "TWO")
+  assert.equal(harness.nativeCalls.length, 1)
 })
 
 test("native NFC alternate path becomes the tagged editable path", async () => {
@@ -1078,10 +1109,11 @@ test("reads are capped at 2000 lines with the native continuation footer", async
 
   const result = await readTool(harness.tools).execute({ path: "big.txt" }, CONTEXT)
   const lines = String(result.content).split("\n")
-  assert.equal(lines.length, 2002)
+  assert.equal(lines.length, 2003)
   assert.match(lines[1], /^1:line-1$/)
   assert.match(lines[2000], /^2000:line-2000$/)
-  assert.equal(lines[2001], "[Output truncated. Continue reading with offset: 2001]")
+  assert.equal(lines[2001], "Lines 1-2000 shown; lines outside this range are NOT seen and cannot be edited until read")
+  assert.equal(lines[2002], "[Output truncated. Continue reading with offset: 2001]")
 })
 
 test("plugin options apply: roots extend the Snapshot Root and the guard can be disabled", async () => {
@@ -1131,7 +1163,7 @@ test("plugin options apply: roots extend the Snapshot Root and the guard can be 
       { patch: `${String(limited.content).split("\n")[0]}\nreplace 2\n+TWO` },
       CONTEXT,
     ),
-    /re-read the missing lines and retry/,
+    /retry the edit now with the same header/,
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
 })
@@ -1295,6 +1327,7 @@ test("resolveHashlineSettings validates roots and defaults the rest", () => {
     maxPaths: 256,
     maxVersionsPerPath: 4,
     maxTotalBytes: 64 * 1024 * 1024,
+    maxTaggedReadBytes: 40 * 1024,
   })
 
   assert.throws(() => resolveHashlineSettings({ roots: "nope" }, root), /roots must be an array/)
@@ -1311,6 +1344,16 @@ test("resolveHashlineSettings validates roots and defaults the rest", () => {
   assert.deepEqual(configured.roots, [path.resolve(root, "extra")])
   assert.equal(configured.maxPaths, 10)
   assert.equal(configured.maxVersionsPerPath, 4)
+
+  assert.throws(
+    () => resolveHashlineSettings({ maxTaggedReadBytes: 0 }, root),
+    /maxTaggedReadBytes must be a positive number/,
+  )
+  assert.throws(
+    () => resolveHashlineSettings({ maxTaggedReadBytes: -40 }, root),
+    /maxTaggedReadBytes must be a positive number/,
+  )
+  assert.equal(resolveHashlineSettings({ maxTaggedReadBytes: 1024 }, root).maxTaggedReadBytes, 1024)
 
   const ignored = resolveHashlineSettings("not-a-record", root)
   assert.equal(ignored.enforceSeenLines, true)

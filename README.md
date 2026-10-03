@@ -55,6 +55,7 @@ v1 reads the same values from a `hashline` section of the config.
 | `maxPaths` | `256` | tracked-file limit of the snapshot store |
 | `maxVersionsPerPath` | `4` | remembered versions per file |
 | `maxTotalBytes` | `67108864` | total snapshot budget in bytes |
+| `maxTaggedReadBytes` | `40960` | byte budget of one tagged text read before truncation |
 
 ## Warning: edit permissions are not enforced
 

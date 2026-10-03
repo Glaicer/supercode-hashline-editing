@@ -130,6 +130,8 @@ test("unseen anchors reveal a bounded preview and allow a retry when complete", 
     const seenLinesError = error as SeenLinesError
     assert.deepEqual(seenLinesError.revealed, [{ line: 9, text: "line-9" }])
     assert.equal(seenLinesError.truncated, false)
+    assert.match(seenLinesError.message, /The missing lines are shown above; retry the edit now with the same header — no re-read needed/)
+    assert.match(seenLinesError.message, /\n9:line-9\n/)
     return true
   })
 
@@ -150,6 +152,8 @@ test("long or over-cap previews stay truncated and do not authorize a retry", as
     assert.equal(seenLinesError.truncated, true)
     assert.equal(seenLinesError.revealed[0].text.length, 512)
     assert.equal(seenLinesError.revealed[0].text.at(-1), "…")
+    assert.match(seenLinesError.message, /Re-read the missing lines with offset 2 and retry/)
+    assert.doesNotMatch(seenLinesError.message, /retry the edit now/)
     return true
   })
   await assert.rejects(service.edit(patch), (error: unknown) => error instanceof SeenLinesError)
@@ -171,6 +175,7 @@ test("reveal previews cap at forty missing lines", async () => {
     assert.equal(seenLinesError.revealed[0].line, 2)
     assert.equal(seenLinesError.revealed.at(-1)?.line, 41)
     assert.equal(seenLinesError.truncated, true)
+    assert.match(seenLinesError.message, /Re-read the missing lines with offset 2 and retry/)
     return true
   })
   await assert.rejects(service.edit(patch), (error: unknown) => error instanceof SeenLinesError)
