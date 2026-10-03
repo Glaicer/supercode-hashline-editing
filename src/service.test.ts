@@ -137,6 +137,8 @@ test("unseen anchors reveal a bounded preview and allow a retry when complete", 
     const seenLinesError = error as SeenLinesError
     assert.deepEqual(seenLinesError.revealed, [{ line: 9, text: "line-9" }])
     assert.equal(seenLinesError.truncated, false)
+    assert.match(seenLinesError.message, /The missing lines are shown above; retry the edit now with the same header — no re-read needed/)
+    assert.match(seenLinesError.message, /\n9:line-9\n/)
     return true
   })
 
@@ -157,6 +159,8 @@ test("long or over-cap previews stay truncated and do not authorize a retry", as
     assert.equal(seenLinesError.truncated, true)
     assert.equal(seenLinesError.revealed[0].text.length, 512)
     assert.equal(seenLinesError.revealed[0].text.at(-1), "…")
+    assert.match(seenLinesError.message, /Re-read the missing lines with offset 2 and retry/)
+    assert.doesNotMatch(seenLinesError.message, /retry the edit now/)
     return true
   })
   await assert.rejects(service.edit(patch), (error: unknown) => error instanceof SeenLinesError)
@@ -178,6 +182,7 @@ test("reveal previews cap at forty missing lines", async () => {
     assert.equal(seenLinesError.revealed[0].line, 2)
     assert.equal(seenLinesError.revealed.at(-1)?.line, 41)
     assert.equal(seenLinesError.truncated, true)
+    assert.match(seenLinesError.message, /Re-read the missing lines with offset 2 and retry/)
     return true
   })
   await assert.rejects(service.edit(patch), (error: unknown) => error instanceof SeenLinesError)
@@ -416,6 +421,16 @@ test("multi-section preflight rejects duplicate canonical paths", async () => {
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\nthree\n")
 })
 
+test("tolerated hunk fixes surface as warnings on the edit result", async () => {
+  const reading = await service.read("a.ts")
+
+  const result = await service.edit([reading.header, "+replace 1", "+ONE"].join("\n"))
+
+  assert.equal(result.sections[0].after, "ONE\ntwo\nthree\n")
+  assert.equal(result.warnings.length, 1)
+  assert.match(result.warnings[0], /removed the leading '\+' from the hunk header "\+replace 1"/)
+})
+
 test("syntax failures still carry an empty commit report", async () => {
   await assert.rejects(
     service.edit("not a hashline patch"),
@@ -521,6 +536,49 @@ test("edit refuses missing files and points to the native write tool", async () 
   await assert.rejects(
     service.edit("[missing.ts#AAAA]\nreplace 1\n+never"),
     (error: unknown) => error instanceof MissingFileError && /native write/i.test(error.message),
+  )
+})
+
+test("registerWritten records the live bytes so an immediate edit succeeds without a read", async () => {
+  await writeFile(path.join(root, "written.ts"), "alpha\nbeta\n")
+  const registration = await service.registerWritten("written.ts")
+  assert.ok(registration)
+  assert.match(registration.header, /^\[written\.ts#[0-9A-F]{4}\]$/)
+  assert.equal(registration.tag, computeTag("alpha\nbeta\n"))
+  assert.equal(registration.path, "written.ts")
+  assert.equal(registration.canonicalPath, path.join(root, "written.ts"))
+
+  const result = await service.edit(`${registration.header}\nreplace 1\n+ALPHA`)
+  assert.equal(await readFile(path.join(root, "written.ts"), "utf8"), "ALPHA\nbeta\n")
+  assert.equal(result.sections[0].firstChangedLine, 1)
+})
+
+test("registerWritten normalizes like read so an edit right after write cannot mismatch", async () => {
+  await writeFile(path.join(root, "bom.txt"), "\uFEFFone\r\ntwo\r\n")
+  const registration = await service.registerWritten("bom.txt")
+  assert.ok(registration)
+  assert.equal(registration.tag, computeTag("one\ntwo\n"))
+  const result = await service.edit(`${registration.header}\nreplace 2\n+TWO`)
+  assert.equal(await readFile(path.join(root, "bom.txt"), "utf8"), "\uFEFFone\r\nTWO\r\n")
+})
+
+test("registerWritten ignores paths outside the Snapshot Root", async () => {
+  assert.equal(await service.registerWritten(path.join(outside, "secret.ts")), null)
+  await assert.rejects(
+    service.edit(`[${path.join(outside, "secret.ts")}#AAAA]\nreplace 1\n+X`),
+    (error: unknown) => error instanceof BoundaryError,
+  )
+  assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
+})
+
+test("the no-snapshot error explains that restarts reset in-memory snapshots", async () => {
+  await assert.rejects(
+    service.edit("[a.ts#AAAA]\nreplace 1\n+X"),
+    (error: unknown) => {
+      assert.ok(error instanceof SnapshotRequiredError)
+      assert.match(error.message, /Snapshots are in-memory and were reset after a restart or location switch/)
+      return true
+    },
   )
 })
 

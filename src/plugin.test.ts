@@ -89,12 +89,21 @@ const DEFINED_INPUT_JSON = {
   },
 }
 
-function addFakeBuiltins(target: ReturnType<typeof createFakeEditor>) {
+interface NativeWriteBehavior {
+  execute: (input: AnyRecord, context: ToolContextLike) => Promise<AnyRecord>
+}
+
+// The disk-writing stub mirrors the host write tool so wrapper re-reads see real bytes.
+function addFakeBuiltins(target: ReturnType<typeof createFakeEditor>, directory: string, nativeWrite?: NativeWriteBehavior) {
   target.add({
     name: "write",
     description: NATIVE_WRITE_DESCRIPTION,
     input: NATIVE_WRITE_INPUT,
-    execute: async () => ({ content: "written" }),
+    options: { codemode: false, permission: "edit" },
+    execute: nativeWrite?.execute ?? (async (input: AnyRecord) => {
+      await writeFile(path.resolve(directory, String(input.path)), String(input.content))
+      return { content: "written" }
+    }),
   })
   target.add({
     name: "patch",
@@ -209,6 +218,7 @@ interface HarnessInput {
   directory: string
   options?: unknown
   nativeRead?: NativeReadBehavior
+  nativeWrite?: NativeWriteBehavior
   filesystem?: FileSystemAdapter
 }
 
@@ -222,10 +232,10 @@ interface Harness {
   replay: (withNative?: boolean) => Map<string, AnyRecord>
 }
 
-async function createHarness({ directory, options, nativeRead, filesystem }: HarnessInput): Promise<Harness> {
+async function createHarness({ directory, options, nativeRead, nativeWrite, filesystem }: HarnessInput): Promise<Harness> {
   const editor = createFakeEditor()
   const nativeCalls: Array<{ input: AnyRecord; context: ToolContextLike }> = []
-  addFakeBuiltins(editor)
+  addFakeBuiltins(editor, directory, nativeWrite)
   const addNativeRead = (target: ReturnType<typeof createFakeEditor>) => {
     if (!nativeRead) return
     target.add({
@@ -281,7 +291,7 @@ async function createHarness({ directory, options, nativeRead, filesystem }: Har
     },
     replay: (withNative = true) => {
       const fresh = createFakeEditor()
-      addFakeBuiltins(fresh)
+      addFakeBuiltins(fresh, directory, nativeWrite)
       if (withNative) addNativeRead(fresh)
       for (const callback of transforms) callback(fresh)
       return fresh.tools
@@ -298,6 +308,12 @@ function readTool(tools: Map<string, AnyRecord>): AnyRecord {
 function editTool(tools: Map<string, AnyRecord>): AnyRecord {
   const tool = tools.get("edit")
   assert.ok(tool, "edit tool must be registered")
+  return tool
+}
+
+function writeTool(tools: Map<string, AnyRecord>): AnyRecord {
+  const tool = tools.get("write")
+  assert.ok(tool, "write tool must be registered")
   return tool
 }
 
@@ -346,6 +362,41 @@ test("tool descriptions require verbatim headers and discourage bypassing reject
     assert.match(tool.description, /Partial reads register valid Snapshots/)
     assert.match(tool.description, /Do not bypass.*write.*shell/)
   }
+})
+
+test("edit content leads with warning lines for tolerated patch fixes", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeRead: { execute: async (input) => nativeTextResult(String(input.path), "one\ntwo\n") },
+  })
+  const read = readTool(harness.tools)
+  const edit = editTool(harness.tools)
+
+  const reading = await read.execute({ path: "a.ts" }, CONTEXT)
+  const fixed = await edit.execute(
+    { patch: `${reading.metadata.header}\n+replace 1\n+ONE` },
+    CONTEXT,
+  )
+  assert.match(String(fixed.content), /^warning: line 2: removed the leading '\+'/)
+  assert.equal(fixed.metadata.warnings.length, 1)
+  assert.match(String(fixed.content), /\[a\.ts#[0-9A-F]{4}\]\nfirstChangedLine: 1/)
+
+  const clean = await edit.execute(
+    { patch: `${fixed.metadata.sections[0].header}\nreplace 1\n+one` },
+    CONTEXT,
+  )
+  assert.doesNotMatch(String(clean.content), /^warning:/m)
+  assert.deepEqual(clean.metadata.warnings, [])
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+})
+
+test("the edit description teaches hunk grammar and the +- escape counterexample", async () => {
+  const harness = await createHarness({ directory: root })
+  const description = editTool(harness.tools).description
+
+  assert.match(description, /never start with `\+`/)
+  assert.match(description, /`\+import`, NOT `\+-import`/)
+  assert.match(description, /Example patch:\n\[src\/a\.ts#A1B2\]\nreplace 3\n\+const x = 1$/)
 })
 
 test("absolute reads recover from relative patch headers without rewriting the file", async () => {
@@ -927,7 +978,7 @@ test("window reads keep absolute line numbers and union SeenLines across reads",
   })
 
   const first = await readTool(harness.tools).execute({ path: "a.ts", limit: 1 }, CONTEXT)
-  assert.match(first.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\n\[Output truncated\. Continue reading with offset: 2\]$/)
+  assert.match(first.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\nLines 1-1 shown; lines outside this range are NOT seen and cannot be edited until read\n\[Output truncated\. Continue reading with offset: 2\]$/)
   const tag = first.metadata.tag
 
   const second = await readTool(harness.tools).execute(
@@ -989,12 +1040,40 @@ test("native byte-limited page bounds the tagged window and SeenLines", async ()
     },
   })
   const result = await readTool(harness.tools).execute({ path: "a.ts" }, CONTEXT)
-  assert.match(result.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\n2:two\n\[Output truncated\. Continue reading with offset: 3\]$/)
+  assert.match(result.content, /^\[a\.ts#[0-9A-F]{4}\]\n1:one\n2:two\nLines 1-2 shown; lines outside this range are NOT seen and cannot be edited until read\n\[Output truncated\. Continue reading with offset: 3\]$/)
   assert.deepEqual(result.metadata.seenLines, [1, 2])
   await assert.rejects(
     editTool(harness.tools).execute({ patch: `${result.metadata.header}\nreplace 3\n+THREE` }, CONTEXT),
     (error: unknown) => error instanceof SeenLinesError,
   )
+})
+
+test("a small maxTaggedReadBytes budget truncates the tagged window earlier", async () => {
+  const line = "x".repeat(100)
+  const text = `${Array.from({ length: 6 }, () => line).join("\n")}\n`
+  await writeFile(path.join(root, "big.txt"), text)
+  const nativeRead = { execute: async (input: AnyRecord) => nativeTextResult(String(input.path), text) }
+
+  const full = await createHarness({ directory: root, nativeRead })
+  const defaultRead = await readTool(full.tools).execute({ path: "big.txt" }, CONTEXT)
+  assert.doesNotMatch(String(defaultRead.content), /Output truncated/)
+  assert.deepEqual(defaultRead.metadata.seenLines, [1, 2, 3, 4, 5, 6])
+
+  const cramped = await createHarness({ directory: root, options: { maxTaggedReadBytes: 320 }, nativeRead })
+  const budgetRead = await readTool(cramped.tools).execute({ path: "big.txt" }, CONTEXT)
+  assert.match(
+    String(budgetRead.content),
+    /^\[big\.txt#[0-9A-F]{4}\]\n1:x{100}\nLines 1-1 shown; lines outside this range are NOT seen and cannot be edited until read\n\[Output truncated\. Continue reading with offset: 2\]$/,
+  )
+  assert.deepEqual(budgetRead.metadata.seenLines, [1])
+
+  const starved = await createHarness({ directory: root, options: { maxTaggedReadBytes: 200 }, nativeRead })
+  const starvedRead = await readTool(starved.tools).execute({ path: "big.txt" }, CONTEXT)
+  assert.match(
+    String(starvedRead.content),
+    /^\[big\.txt#[0-9A-F]{4}\]\nNo lines are shown; read the file to edit it\n\[Output truncated\. Continue reading with offset: 1\]$/,
+  )
+  assert.deepEqual(starvedRead.metadata.seenLines, [])
 })
 
 test("unseen Anchors reveal up to forty lines; truncated previews do not authorize retry", async () => {
@@ -1013,6 +1092,7 @@ test("unseen Anchors reveal up to forty lines; truncated previews do not authori
       assert.equal(error.revealed.length, 40)
       assert.equal(error.revealed[0].text, "line-2")
       assert.equal(error.truncated, true)
+      assert.match(error.message, /Re-read the missing lines with offset 2 and retry/)
       assert.deepEqual((error as AnyRecord).written, [])
       return true
     })
@@ -1022,10 +1102,12 @@ test("unseen Anchors reveal up to forty lines; truncated previews do not authori
     assert.ok(error instanceof SeenLinesError)
     assert.deepEqual(error.revealed, [{ line: 2, text: "line-2" }])
     assert.equal(error.truncated, false)
+    assert.match(error.message, /The missing lines are shown above; retry the edit now with the same header — no re-read needed/)
     return true
   })
   await edit.execute({ patch: shortPatch }, CONTEXT)
   assert.equal((await readFile(path.join(root, "a.ts"), "utf8")).split("\n")[1], "TWO")
+  assert.equal(harness.nativeCalls.length, 1)
 })
 
 test("native NFC alternate path becomes the tagged editable path", async () => {
@@ -1078,10 +1160,11 @@ test("reads are capped at 2000 lines with the native continuation footer", async
 
   const result = await readTool(harness.tools).execute({ path: "big.txt" }, CONTEXT)
   const lines = String(result.content).split("\n")
-  assert.equal(lines.length, 2002)
+  assert.equal(lines.length, 2003)
   assert.match(lines[1], /^1:line-1$/)
   assert.match(lines[2000], /^2000:line-2000$/)
-  assert.equal(lines[2001], "[Output truncated. Continue reading with offset: 2001]")
+  assert.equal(lines[2001], "Lines 1-2000 shown; lines outside this range are NOT seen and cannot be edited until read")
+  assert.equal(lines[2002], "[Output truncated. Continue reading with offset: 2001]")
 })
 
 test("plugin options apply: roots extend the Snapshot Root and the guard can be disabled", async () => {
@@ -1131,7 +1214,7 @@ test("plugin options apply: roots extend the Snapshot Root and the guard can be 
       { patch: `${String(limited.content).split("\n")[0]}\nreplace 2\n+TWO` },
       CONTEXT,
     ),
-    /re-read the missing lines and retry/,
+    /retry the edit now with the same header/,
   )
   assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
 })
@@ -1295,6 +1378,7 @@ test("resolveHashlineSettings validates roots and defaults the rest", () => {
     maxPaths: 256,
     maxVersionsPerPath: 4,
     maxTotalBytes: 64 * 1024 * 1024,
+    maxTaggedReadBytes: 40 * 1024,
   })
 
   assert.throws(() => resolveHashlineSettings({ roots: "nope" }, root), /roots must be an array/)
@@ -1311,6 +1395,16 @@ test("resolveHashlineSettings validates roots and defaults the rest", () => {
   assert.deepEqual(configured.roots, [path.resolve(root, "extra")])
   assert.equal(configured.maxPaths, 10)
   assert.equal(configured.maxVersionsPerPath, 4)
+
+  assert.throws(
+    () => resolveHashlineSettings({ maxTaggedReadBytes: 0 }, root),
+    /maxTaggedReadBytes must be a positive number/,
+  )
+  assert.throws(
+    () => resolveHashlineSettings({ maxTaggedReadBytes: -40 }, root),
+    /maxTaggedReadBytes must be a positive number/,
+  )
+  assert.equal(resolveHashlineSettings({ maxTaggedReadBytes: 1024 }, root).maxTaggedReadBytes, 1024)
 
   const ignored = resolveHashlineSettings("not-a-record", root)
   assert.equal(ignored.enforceSeenLines, true)
@@ -1330,5 +1424,76 @@ test("domain errors keep their class across the wrapper", async () => {
   await assert.rejects(
     readTool(harness.tools).execute({ path: "missing.ts" }, CONTEXT),
     (error: unknown) => error instanceof Error && error.name === "FileNotFoundError",
+  )
+})
+
+
+test("the write wrapper copies the native entry verbatim and appends the snapshot header", async () => {
+  const harness = await createHarness({ directory: root })
+  const write = writeTool(harness.tools)
+  assert.equal(write.description, NATIVE_WRITE_DESCRIPTION)
+  assert.equal(write.input, NATIVE_WRITE_INPUT)
+  assert.deepEqual(write.options, { codemode: false, permission: "edit" })
+
+  const result = await write.execute({ path: "a.ts", content: "one\ntwo\n" }, CONTEXT)
+  const [nativeLine, header] = result.content.split("\n")
+  assert.equal(nativeLine, "written")
+  assert.match(header, /^\[a\.ts#[0-9A-F]{4}\]$/)
+  assert.deepEqual(result.metadata, {
+    path: "a.ts",
+    canonicalPath: path.join(root, "a.ts"),
+    tag: header.slice(1, -1).split("#")[1],
+    header,
+  })
+})
+
+test("write to an existing file registers a snapshot and the next edit succeeds without a read", async () => {
+  const harness = await createHarness({ directory: root })
+  const written = await writeTool(harness.tools).execute({ path: "a.ts", content: "one\ntwo\nthree\n" }, CONTEXT)
+  const header = written.content.split("\n").at(-1)
+
+  await editTool(harness.tools).execute({ patch: `${header}\nreplace 2\n+TWO` }, CONTEXT)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\nTWO\nthree\n")
+})
+
+test("write of a new file registers a snapshot so the created file is immediately editable", async () => {
+  const harness = await createHarness({ directory: root })
+  const written = await writeTool(harness.tools).execute({ path: "new.ts", content: "alpha\nbeta\n" }, CONTEXT)
+  const header = written.content.split("\n").at(-1)
+  assert.match(header, /^\[new\.ts#[0-9A-F]{4}\]$/)
+
+  await editTool(harness.tools).execute({ patch: `${header}\nappend\n+gamma` }, CONTEXT)
+  assert.equal(await readFile(path.join(root, "new.ts"), "utf8"), "alpha\nbeta\ngamma\n")
+})
+
+test("a failed write registers nothing and propagates the native failure", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeWrite: {
+      execute: async () => {
+        throw new Error("permission denied")
+      },
+    },
+  })
+  await assert.rejects(
+    writeTool(harness.tools).execute({ path: "a.ts", content: "evil\n" }, CONTEXT),
+    /permission denied/,
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+  await assert.rejects(
+    editTool(harness.tools).execute({ patch: "[a.ts#AAAA]\nreplace 1\n+EVIL" }, CONTEXT),
+    (error: unknown) => error instanceof SnapshotRequiredError,
+  )
+})
+
+test("a write outside the Snapshot Root returns the native result unchanged and registers nothing", async () => {
+  const harness = await createHarness({ directory: root })
+  const outsidePath = path.join(outside, "secret.ts")
+  const result = await writeTool(harness.tools).execute({ path: outsidePath, content: "hacked\n" }, CONTEXT)
+  assert.deepEqual(result, { content: "written" })
+  assert.equal(await readFile(outsidePath, "utf8"), "hacked\n")
+  await assert.rejects(
+    editTool(harness.tools).execute({ patch: `[${outsidePath}#AAAA]\nreplace 1\n+X` }, CONTEXT),
+    (error: unknown) => error instanceof BoundaryError,
   )
 })
