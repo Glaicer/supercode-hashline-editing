@@ -93,6 +93,7 @@ export interface HashlinePluginSettings {
   maxPaths: number
   maxVersionsPerPath: number
   maxTotalBytes: number
+  maxTaggedReadBytes: number
 }
 
 const DEFAULT_SETTINGS: HashlinePluginSettings = Object.freeze({
@@ -101,6 +102,7 @@ const DEFAULT_SETTINGS: HashlinePluginSettings = Object.freeze({
   maxPaths: SnapshotStoreLimits.maxPaths,
   maxVersionsPerPath: SnapshotStoreLimits.maxVersionsPerPath,
   maxTotalBytes: SnapshotStoreLimits.maxTotalBytes,
+  maxTaggedReadBytes: MAX_TAGGED_READ_BYTES,
 })
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -139,8 +141,12 @@ function resolveConfiguredRoots(roots: unknown, directory: string): string[] {
 
 export function resolveHashlineSettings(raw: unknown, directory: string): HashlinePluginSettings {
   const options = isRecord(raw) ? raw : {}
-  const numberOr = (key: "maxPaths" | "maxVersionsPerPath" | "maxTotalBytes"): number =>
+  const numberOr = (key: "maxPaths" | "maxVersionsPerPath" | "maxTotalBytes" | "maxTaggedReadBytes"): number =>
     typeof options[key] === "number" ? (options[key] as number) : DEFAULT_SETTINGS[key]
+  const maxTaggedReadBytes = numberOr("maxTaggedReadBytes")
+  if (!Number.isFinite(maxTaggedReadBytes) || maxTaggedReadBytes <= 0) {
+    throw new TypeError("hashline maxTaggedReadBytes must be a positive number")
+  }
   return {
     enforceSeenLines:
       typeof options.enforceSeenLines === "boolean"
@@ -150,6 +156,7 @@ export function resolveHashlineSettings(raw: unknown, directory: string): Hashli
     maxPaths: numberOr("maxPaths"),
     maxVersionsPerPath: numberOr("maxVersionsPerPath"),
     maxTotalBytes: numberOr("maxTotalBytes"),
+    maxTaggedReadBytes,
   }
 }
 
@@ -209,7 +216,7 @@ function clampLineText(text: string): string {
   return text.length > MAX_LINE_LENGTH ? text.slice(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : text
 }
 
-function nativeTextWindow(native: NativeToolResult, input: ReadToolInput): TextReadWindow {
+function nativeTextWindow(native: NativeToolResult, input: ReadToolInput, maxTaggedReadBytes: number): TextReadWindow {
   const output = native.output
   if (!isRecord(output) || typeof output.content !== "string") return { start: 1, limit: 0, truncated: false, next: undefined }
   const text = output.type === "file" ? output.content.replace(/\n$/, "") : output.content
@@ -217,7 +224,7 @@ function nativeTextWindow(native: NativeToolResult, input: ReadToolInput): TextR
   const lines = output.content === "" ? emptyPage ? [""] : [] : text.split("\n")
   const maximum = Math.min(input.limit || MAX_READ_LINES, MAX_READ_LINES, lines.length)
   const start = input.offset || 1
-  let budget = MAX_TAGGED_READ_BYTES - Buffer.byteLength(
+  let budget = maxTaggedReadBytes - Buffer.byteLength(
     `[${input.path}#FFFF]\n${visibilityNote(999999999, 999999999)}\n${TRUNCATION_FOOTER(999999999)}\n`,
   )
   let limit = 0
@@ -271,10 +278,12 @@ function makeReadTool({
   service,
   nativeRead,
   assertBoundary,
+  maxTaggedReadBytes,
 }: {
   service: HashlineService
   nativeRead: (Info & { readonly id: string }) | undefined
   assertBoundary: (inputPath: string) => Promise<void>
+  maxTaggedReadBytes: number
 }): Info {
   return {
     name: READ_NAME,
@@ -296,7 +305,7 @@ function makeReadTool({
       }
 
       const output = native.output
-      const { start, limit, truncated, next } = nativeTextWindow(native, input)
+      const { start, limit, truncated, next } = nativeTextWindow(native, input, maxTaggedReadBytes)
       let result: ReadResult
       try {
         result = await service.read(input.path, limit, input.offset, (line) => line.length <= MAX_LINE_LENGTH)
@@ -377,7 +386,7 @@ export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem
 
   const registration = await input.tool.transform((editor: ToolEditor) => {
     const nativeRead = editor.get(READ_NAME)
-    editor.add(makeReadTool({ service, nativeRead, assertBoundary }))
+    editor.add(makeReadTool({ service, nativeRead, assertBoundary, maxTaggedReadBytes: settings.maxTaggedReadBytes }))
     editor.add(makeEditTool({ service }))
   })
   const surfaceHook = makeSurfaceHook(input.tool.list)

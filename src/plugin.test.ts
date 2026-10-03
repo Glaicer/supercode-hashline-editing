@@ -997,6 +997,26 @@ test("native byte-limited page bounds the tagged window and SeenLines", async ()
   )
 })
 
+test("a small maxTaggedReadBytes budget truncates the tagged window earlier", async () => {
+  const line = "x".repeat(100)
+  const text = `${Array.from({ length: 6 }, () => line).join("\n")}\n`
+  await writeFile(path.join(root, "big.txt"), text)
+  const nativeRead = { execute: async (input: AnyRecord) => nativeTextResult(String(input.path), text) }
+
+  const full = await createHarness({ directory: root, nativeRead })
+  const defaultRead = await readTool(full.tools).execute({ path: "big.txt" }, CONTEXT)
+  assert.doesNotMatch(String(defaultRead.content), /Output truncated/)
+  assert.deepEqual(defaultRead.metadata.seenLines, [1, 2, 3, 4, 5, 6])
+
+  const cramped = await createHarness({ directory: root, options: { maxTaggedReadBytes: 320 }, nativeRead })
+  const budgetRead = await readTool(cramped.tools).execute({ path: "big.txt" }, CONTEXT)
+  assert.match(
+    String(budgetRead.content),
+    /^\[big\.txt#[0-9A-F]{4}\]\n1:x{100}\nLines 1-1 shown; lines outside this range are NOT seen and cannot be edited until read\n\[Output truncated\. Continue reading with offset: 2\]$/,
+  )
+  assert.deepEqual(budgetRead.metadata.seenLines, [1])
+})
+
 test("unseen Anchors reveal up to forty lines; truncated previews do not authorize retry", async () => {
   const lines = Array.from({ length: 50 }, (_, index) => `line-${index + 1}`)
   await writeFile(path.join(root, "a.ts"), `${lines.join("\n")}\n`)
@@ -1299,6 +1319,7 @@ test("resolveHashlineSettings validates roots and defaults the rest", () => {
     maxPaths: 256,
     maxVersionsPerPath: 4,
     maxTotalBytes: 64 * 1024 * 1024,
+    maxTaggedReadBytes: 40 * 1024,
   })
 
   assert.throws(() => resolveHashlineSettings({ roots: "nope" }, root), /roots must be an array/)
@@ -1315,6 +1336,16 @@ test("resolveHashlineSettings validates roots and defaults the rest", () => {
   assert.deepEqual(configured.roots, [path.resolve(root, "extra")])
   assert.equal(configured.maxPaths, 10)
   assert.equal(configured.maxVersionsPerPath, 4)
+
+  assert.throws(
+    () => resolveHashlineSettings({ maxTaggedReadBytes: 0 }, root),
+    /maxTaggedReadBytes must be a positive number/,
+  )
+  assert.throws(
+    () => resolveHashlineSettings({ maxTaggedReadBytes: -40 }, root),
+    /maxTaggedReadBytes must be a positive number/,
+  )
+  assert.equal(resolveHashlineSettings({ maxTaggedReadBytes: 1024 }, root).maxTaggedReadBytes, 1024)
 
   const ignored = resolveHashlineSettings("not-a-record", root)
   assert.equal(ignored.enforceSeenLines, true)
