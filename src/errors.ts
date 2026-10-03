@@ -25,17 +25,21 @@ export interface MismatchDetails {
   expectedTag: string
   actualTag: string
   reason?: string
+  liveLineCount?: number
 }
 
 export class MismatchError extends HashlineError {
   path: string
   expectedTag: string
   actualTag: string
-  constructor({ path, expectedTag, actualTag, reason }: MismatchDetails) {
+  constructor({ path, expectedTag, actualTag, reason, liveLineCount }: MismatchDetails) {
+    const details = [liveLineCount === undefined ? undefined : `${liveLineCount} lines`, reason]
+      .filter((part) => part !== undefined)
+      .join("; ")
     super(
       `Snapshot mismatch for ${path}: section uses #${expectedTag}, live file is #${actualTag}${
-        reason ? ` (${reason})` : ""
-      }; re-read the file and retry`,
+        details ? ` (${details})` : ""
+      }. If your line numbers still apply, retry with this header: [${path}#${actualTag}]; if the file shifted, re-read around your hunks`,
     )
     this.name = "MismatchError"
     this.path = path

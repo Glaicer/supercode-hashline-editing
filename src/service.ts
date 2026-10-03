@@ -135,7 +135,12 @@ function mapFilesystemError(error: unknown, operation: string, displayPath: stri
   if (error instanceof PathBoundaryError) return new BoundaryError(displayPath, roots)
   if (error instanceof FileNotFoundError && operation === "edit") return new MissingFileError(displayPath)
   if (error instanceof LiveFileChangedError && expectedTag) {
-    return new MismatchError({ path: displayPath, expectedTag, actualTag: computeTag(error.actualText) })
+    return new MismatchError({
+      path: displayPath,
+      expectedTag,
+      actualTag: computeTag(error.actualText),
+      liveLineCount: splitAddressableLines(error.actualText).length,
+    })
   }
   return error
 }
@@ -478,6 +483,7 @@ export class HashlineService {
         expectedTag: section.tag,
         actualTag: computeTag(file.text),
         reason: "the read path now resolves to a different file",
+        liveLineCount: splitAddressableLines(file.text).length,
       })
     }
 
@@ -488,10 +494,12 @@ export class HashlineService {
       file.text,
     )
     if (candidates.length === 0) {
+      this._registerObservedLiveSnapshot(file)
       throw new MismatchError({
         path: section.path,
         expectedTag: section.tag,
         actualTag: computeTag(file.text),
+        liveLineCount: splitAddressableLines(file.text).length,
       })
     }
     if (candidates.length !== 1 || exact.length !== 1) {
@@ -499,10 +507,40 @@ export class HashlineService {
         path: section.path,
         expectedTag: section.tag,
         actualTag: computeTag(file.text),
+        liveLineCount: splitAddressableLines(file.text).length,
       })
     }
 
     return exact[0]
+  }
+
+  /**
+   * Record the live bytes observed at a mismatch so a retry with the fresh
+   * header can resolve without a re-read. Observation only: writes stay gated
+   * by byte-match revalidation, and only lines identical to the newest known
+   * version carry their seen state over.
+   */
+  _registerObservedLiveSnapshot(file: ReadFileResult): void {
+    const [prior] = this.store.find(file.canonicalPath, file.rootId)
+    const liveLines = splitAddressableLines(file.text)
+    const seenLines = new Set<number>()
+    if (prior) {
+      const priorLines = splitAddressableLines(prior.text)
+      const shared = Math.min(priorLines.length, liveLines.length)
+      for (let index = 0; index < shared; index += 1) {
+        if (priorLines[index] === liveLines[index] && prior.seenLines.has(index + 1)) {
+          seenLines.add(index + 1)
+        }
+      }
+    }
+    this.store.record({
+      canonicalPath: file.canonicalPath,
+      rootId: file.rootId,
+      text: file.text,
+      seenLines,
+      lineEnding: file.lineEnding,
+      bom: file.bom,
+    })
   }
 
   _prepareSection(section: PatchSection, file: ReadFileResult): PreparedPlan {
