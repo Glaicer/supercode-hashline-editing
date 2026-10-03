@@ -89,12 +89,21 @@ const DEFINED_INPUT_JSON = {
   },
 }
 
-function addFakeBuiltins(target: ReturnType<typeof createFakeEditor>) {
+interface NativeWriteBehavior {
+  execute: (input: AnyRecord, context: ToolContextLike) => Promise<AnyRecord>
+}
+
+// The disk-writing stub mirrors the host write tool so wrapper re-reads see real bytes.
+function addFakeBuiltins(target: ReturnType<typeof createFakeEditor>, directory: string, nativeWrite?: NativeWriteBehavior) {
   target.add({
     name: "write",
     description: NATIVE_WRITE_DESCRIPTION,
     input: NATIVE_WRITE_INPUT,
-    execute: async () => ({ content: "written" }),
+    options: { codemode: false, permission: "edit" },
+    execute: nativeWrite?.execute ?? (async (input: AnyRecord) => {
+      await writeFile(path.resolve(directory, String(input.path)), String(input.content))
+      return { content: "written" }
+    }),
   })
   target.add({
     name: "patch",
@@ -209,6 +218,7 @@ interface HarnessInput {
   directory: string
   options?: unknown
   nativeRead?: NativeReadBehavior
+  nativeWrite?: NativeWriteBehavior
   filesystem?: FileSystemAdapter
 }
 
@@ -222,10 +232,10 @@ interface Harness {
   replay: (withNative?: boolean) => Map<string, AnyRecord>
 }
 
-async function createHarness({ directory, options, nativeRead, filesystem }: HarnessInput): Promise<Harness> {
+async function createHarness({ directory, options, nativeRead, nativeWrite, filesystem }: HarnessInput): Promise<Harness> {
   const editor = createFakeEditor()
   const nativeCalls: Array<{ input: AnyRecord; context: ToolContextLike }> = []
-  addFakeBuiltins(editor)
+  addFakeBuiltins(editor, directory, nativeWrite)
   const addNativeRead = (target: ReturnType<typeof createFakeEditor>) => {
     if (!nativeRead) return
     target.add({
@@ -281,7 +291,7 @@ async function createHarness({ directory, options, nativeRead, filesystem }: Har
     },
     replay: (withNative = true) => {
       const fresh = createFakeEditor()
-      addFakeBuiltins(fresh)
+      addFakeBuiltins(fresh, directory, nativeWrite)
       if (withNative) addNativeRead(fresh)
       for (const callback of transforms) callback(fresh)
       return fresh.tools
@@ -298,6 +308,12 @@ function readTool(tools: Map<string, AnyRecord>): AnyRecord {
 function editTool(tools: Map<string, AnyRecord>): AnyRecord {
   const tool = tools.get("edit")
   assert.ok(tool, "edit tool must be registered")
+  return tool
+}
+
+function writeTool(tools: Map<string, AnyRecord>): AnyRecord {
+  const tool = tools.get("write")
+  assert.ok(tool, "write tool must be registered")
   return tool
 }
 
@@ -1408,5 +1424,76 @@ test("domain errors keep their class across the wrapper", async () => {
   await assert.rejects(
     readTool(harness.tools).execute({ path: "missing.ts" }, CONTEXT),
     (error: unknown) => error instanceof Error && error.name === "FileNotFoundError",
+  )
+})
+
+
+test("the write wrapper copies the native entry verbatim and appends the snapshot header", async () => {
+  const harness = await createHarness({ directory: root })
+  const write = writeTool(harness.tools)
+  assert.equal(write.description, NATIVE_WRITE_DESCRIPTION)
+  assert.equal(write.input, NATIVE_WRITE_INPUT)
+  assert.deepEqual(write.options, { codemode: false, permission: "edit" })
+
+  const result = await write.execute({ path: "a.ts", content: "one\ntwo\n" }, CONTEXT)
+  const [nativeLine, header] = result.content.split("\n")
+  assert.equal(nativeLine, "written")
+  assert.match(header, /^\[a\.ts#[0-9A-F]{4}\]$/)
+  assert.deepEqual(result.metadata, {
+    path: "a.ts",
+    canonicalPath: path.join(root, "a.ts"),
+    tag: header.slice(1, -1).split("#")[1],
+    header,
+  })
+})
+
+test("write to an existing file registers a snapshot and the next edit succeeds without a read", async () => {
+  const harness = await createHarness({ directory: root })
+  const written = await writeTool(harness.tools).execute({ path: "a.ts", content: "one\ntwo\nthree\n" }, CONTEXT)
+  const header = written.content.split("\n").at(-1)
+
+  await editTool(harness.tools).execute({ patch: `${header}\nreplace 2\n+TWO` }, CONTEXT)
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\nTWO\nthree\n")
+})
+
+test("write of a new file registers a snapshot so the created file is immediately editable", async () => {
+  const harness = await createHarness({ directory: root })
+  const written = await writeTool(harness.tools).execute({ path: "new.ts", content: "alpha\nbeta\n" }, CONTEXT)
+  const header = written.content.split("\n").at(-1)
+  assert.match(header, /^\[new\.ts#[0-9A-F]{4}\]$/)
+
+  await editTool(harness.tools).execute({ patch: `${header}\nappend\n+gamma` }, CONTEXT)
+  assert.equal(await readFile(path.join(root, "new.ts"), "utf8"), "alpha\nbeta\ngamma\n")
+})
+
+test("a failed write registers nothing and propagates the native failure", async () => {
+  const harness = await createHarness({
+    directory: root,
+    nativeWrite: {
+      execute: async () => {
+        throw new Error("permission denied")
+      },
+    },
+  })
+  await assert.rejects(
+    writeTool(harness.tools).execute({ path: "a.ts", content: "evil\n" }, CONTEXT),
+    /permission denied/,
+  )
+  assert.equal(await readFile(path.join(root, "a.ts"), "utf8"), "one\ntwo\n")
+  await assert.rejects(
+    editTool(harness.tools).execute({ patch: "[a.ts#AAAA]\nreplace 1\n+EVIL" }, CONTEXT),
+    (error: unknown) => error instanceof SnapshotRequiredError,
+  )
+})
+
+test("a write outside the Snapshot Root returns the native result unchanged and registers nothing", async () => {
+  const harness = await createHarness({ directory: root })
+  const outsidePath = path.join(outside, "secret.ts")
+  const result = await writeTool(harness.tools).execute({ path: outsidePath, content: "hacked\n" }, CONTEXT)
+  assert.deepEqual(result, { content: "written" })
+  assert.equal(await readFile(outsidePath, "utf8"), "hacked\n")
+  await assert.rejects(
+    editTool(harness.tools).execute({ patch: `[${outsidePath}#AAAA]\nreplace 1\n+X` }, CONTEXT),
+    (error: unknown) => error instanceof BoundaryError,
   )
 })

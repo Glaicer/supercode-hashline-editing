@@ -45,6 +45,14 @@ export interface ReadResult {
   seenLines: number[]
 }
 
+export interface WrittenRegistration {
+  path: string
+  canonicalPath: string
+  rootId: string
+  tag: string
+  header: string
+}
+
 export interface SectionResult {
   path: string
   canonicalPath: string
@@ -429,6 +437,28 @@ export class HashlineService {
       tag: snapshot.tag,
       seenLines: [...snapshot.seenLines].sort((left, right) => left - right),
     }
+  }
+
+  async registerWritten(inputPath: string): Promise<WrittenRegistration | null> {
+    let file: ReadFileResult
+    try {
+      file = await this.filesystem.read(inputPath, this.directory)
+    } catch (error) {
+      if (error instanceof PathBoundaryError) return null
+      throw error
+    }
+    const lines = splitAddressableLines(file.text)
+    const snapshot = this.store.record({
+      canonicalPath: file.canonicalPath,
+      rootId: file.rootId,
+      text: file.text,
+      seenLines: asLineNumbers(1, lines, () => true),
+      lineEnding: file.lineEnding,
+      bom: file.bom,
+    })
+    const header = formatHeader(inputPath, snapshot.tag)
+    this.readCapabilities.set(capabilityKey(inputPath, file.rootId), { canonicalPath: file.canonicalPath, header })
+    return { path: inputPath, canonicalPath: file.canonicalPath, rootId: file.rootId, tag: snapshot.tag, header }
   }
 
   _resolveSnapshot(section: PatchSection, file: ReadFileResult): Snapshot {

@@ -386,6 +386,49 @@ test("edit refuses missing files and points to the native write tool", async () 
   )
 })
 
+test("registerWritten records the live bytes so an immediate edit succeeds without a read", async () => {
+  await writeFile(path.join(root, "written.ts"), "alpha\nbeta\n")
+  const registration = await service.registerWritten("written.ts")
+  assert.ok(registration)
+  assert.match(registration.header, /^\[written\.ts#[0-9A-F]{4}\]$/)
+  assert.equal(registration.tag, computeTag("alpha\nbeta\n"))
+  assert.equal(registration.path, "written.ts")
+  assert.equal(registration.canonicalPath, path.join(root, "written.ts"))
+
+  const result = await service.edit(`${registration.header}\nreplace 1\n+ALPHA`)
+  assert.equal(await readFile(path.join(root, "written.ts"), "utf8"), "ALPHA\nbeta\n")
+  assert.equal(result.sections[0].firstChangedLine, 1)
+})
+
+test("registerWritten normalizes like read so an edit right after write cannot mismatch", async () => {
+  await writeFile(path.join(root, "bom.txt"), "\uFEFFone\r\ntwo\r\n")
+  const registration = await service.registerWritten("bom.txt")
+  assert.ok(registration)
+  assert.equal(registration.tag, computeTag("one\ntwo\n"))
+  const result = await service.edit(`${registration.header}\nreplace 2\n+TWO`)
+  assert.equal(await readFile(path.join(root, "bom.txt"), "utf8"), "\uFEFFone\r\nTWO\r\n")
+})
+
+test("registerWritten ignores paths outside the Snapshot Root", async () => {
+  assert.equal(await service.registerWritten(path.join(outside, "secret.ts")), null)
+  await assert.rejects(
+    service.edit(`[${path.join(outside, "secret.ts")}#AAAA]\nreplace 1\n+X`),
+    (error: unknown) => error instanceof BoundaryError,
+  )
+  assert.equal(await readFile(path.join(outside, "secret.ts"), "utf8"), "secret\n")
+})
+
+test("the no-snapshot error explains that restarts reset in-memory snapshots", async () => {
+  await assert.rejects(
+    service.edit("[a.ts#AAAA]\nreplace 1\n+X"),
+    (error: unknown) => {
+      assert.ok(error instanceof SnapshotRequiredError)
+      assert.match(error.message, /Snapshots are in-memory and were reset after a restart or location switch/)
+      return true
+    },
+  )
+})
+
 test("invalid ranges fail before writing with the file line count", async () => {
   const reading = await service.read("a.ts")
 

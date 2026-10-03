@@ -4,7 +4,7 @@ import { realpath } from "node:fs/promises"
 
 import { Schema } from "effect"
 import { HashlineService } from "./service.ts"
-import type { EditResult, ReadResult } from "./service.ts"
+import type { EditResult, ReadResult, WrittenRegistration } from "./service.ts"
 import { InMemorySnapshotStore, SnapshotStoreLimits } from "./snapshots.ts"
 import { FileNotFoundError, isInside } from "./filesystem.ts"
 import type { FileSystemAdapter } from "./filesystem.ts"
@@ -192,6 +192,7 @@ type NativeToolResult = Result
 
 type ReadToolInput = { path: string; offset?: number; limit?: number }
 type EditToolInput = { patch: string }
+type WriteToolInput = { path: string; content: string }
 
 interface TextReadWindow {
   readonly start: number
@@ -326,6 +327,44 @@ function makeReadTool({
   }
 }
 
+function serializableWriteMetadata(registration: WrittenRegistration) {
+  return {
+    path: registration.path,
+    canonicalPath: registration.canonicalPath,
+    tag: registration.tag,
+    header: registration.header,
+  }
+}
+
+function makeWriteTool({
+  service,
+  nativeWrite,
+}: {
+  service: HashlineService
+  nativeWrite: Info & { readonly id: string }
+}): Info {
+  return {
+    name: WRITE_NAME,
+    ...(nativeWrite.options ? { options: nativeWrite.options } : {}),
+    description: nativeWrite.description,
+    input: nativeWrite.input,
+    output: nativeWrite.output,
+    async execute(input: WriteToolInput, context: ToolContext) {
+      const native = (await nativeWrite.execute(input, context)) as NativeToolResult
+      const registration = await service.registerWritten(input.path)
+      if (!registration) return native
+      const header = registration.header
+      const content =
+        typeof native.content === "string" && native.content !== "" ? `${native.content}\n${header}` : header
+      return {
+        ...native,
+        content,
+        metadata: { ...native.metadata, ...serializableWriteMetadata(registration) },
+      }
+    },
+  }
+}
+
 function makeEditTool({ service }: { service: HashlineService }): Info {
   return {
     name: EDIT_NAME,
@@ -386,6 +425,8 @@ export async function setupHashlinePlugin(input: HashlinePluginInput, filesystem
     const nativeRead = editor.get(READ_NAME)
     editor.add(makeReadTool({ service, nativeRead, assertBoundary, maxTaggedReadBytes: settings.maxTaggedReadBytes }))
     editor.add(makeEditTool({ service }))
+    const nativeWrite = editor.get(WRITE_NAME)
+    if (nativeWrite) editor.add(makeWriteTool({ service, nativeWrite }))
   })
   const surfaceHook = makeSurfaceHook(input.tool.list)
   const hookRegistrations = await Promise.all(
